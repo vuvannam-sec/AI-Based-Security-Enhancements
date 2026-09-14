@@ -1,19 +1,41 @@
 # Python
 .venv/
+venv/
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
+*.egg-info/
 
-# Data và models (không commit lên git)
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# Generated data and model artifacts
 data/
 *.pkl
 *.joblib
 
-# IDE/Editor
+# Logs and runtime files
+*.log
+*.pid
+
+# IDE / OS
 .vscode/
 .idea/
 *.bak
 .DS_Store
-
-# Logs
-*.log
+Thumbs.db
