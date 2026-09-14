@@ -1,109 +1,136 @@
-# AI-Based Security Enhancements (OS Project)
+# AI-Based Security Enhancements
 
-Hệ thống phát hiện và ngăn chặn xâm nhập theo thời gian thực trên Linux.
+A Linux host-monitoring prototype that combines process telemetry, lightweight machine-learning classification, policy-based detection, and cgroup-based response.
 
-## Tổng quan
+The project is intended for local experimentation and operating-systems/security coursework. It is not a production endpoint-protection product.
 
-Hệ thống giám sát các tiến trình đang chạy, sử dụng model ML để phát hiện hành vi đáng ngờ, và thực thi phản hồi theo thời gian thực.
+## What it does
 
-Gồm 5 thành phần chính:
+The system is split into five small services:
 
-- Sensor: Thu thập sự kiện từ tiến trình qua /proc filesystem
-- ML Service: Dự đoán hành vi bình thường hay tấn công (RandomForest)
-- Enforcer: Giới hạn/dừng tiến trình nguy hiểm bằng cgroup v2
-- Orchestrator: API tích hợp pipeline detect-and-respond
-- Streamlit UI: Dashboard và cảnh báo thời gian thực
+- **Sensor** — samples process activity from Linux `/proc` and produces a shared event schema.
+- **ML service** — classifies events with a scikit-learn pipeline trained on generated data.
+- **Enforcer** — applies CPU/memory limits through Linux cgroups or terminates a selected process.
+- **Orchestrator** — sends events through classification and optional enforcement.
+- **Dashboard** — exposes service status, detections, and demo controls through Streamlit.
 
-Môi trường: Ubuntu VM (VirtualBox), Python 3.10+
+```text
+/proc
+  |
+  v
+Sensor ---> ML service ---> Orchestrator ---> Enforcer
+  |                                |
+  +--------------------------------+----> Dashboard
+```
 
-## Yêu cầu hệ thống
+## Project status
 
-- Ubuntu 22.04+ (VM hoặc native)
+This repository is a working research/teaching prototype. The current implementation uses `/proc` polling and synthetic training data. Detection quality therefore should not be interpreted as a real-world security benchmark.
+
+Known limitations:
+
+- process telemetry is sampled rather than event-driven;
+- the training set is synthetic;
+- there is no authentication layer between local services;
+- enforcement requires elevated privileges;
+- data-exfiltration detection and eBPF collection are not implemented yet.
+
+## Requirements
+
+- Linux with `/proc` available (Ubuntu 22.04+ recommended)
 - Python 3.10+
-- Quyền sudo (cho Enforcer)
+- cgroup v2 preferred; limited cgroup v1 fallback is included
+- `sudo` for the Enforcer service
 
-## Cài đặt và huấn luyện (chạy 1 lần)
+The default launcher binds services to `127.0.0.1`. Do not expose the privileged Enforcer API to an untrusted network.
 
-cd ~/AI-Based-Security-Enhancements
+## Setup
+
+```bash
+git clone https://github.com/vuvannam-sec/AI-Based-Security-Enhancements.git
+cd AI-Based-Security-Enhancements
 chmod +x scripts/*.sh
 ./scripts/setup_and_train.sh
+```
 
-Lệnh này sẽ tạo ra:
+Setup creates a local virtual environment, generates synthetic events, and trains the classifier. Generated datasets and model artifacts are intentionally excluded from Git.
 
-- data/synthetic/synthetic_events.csv - dữ liệu huấn luyện
-- data/models/classifier_pipeline.joblib - model đã train
+## Run
 
-## Chạy hệ thống
-
-cd ~/AI-Based-Security-Enhancements
+```bash
 ./scripts/run_all.sh
+```
 
-Truy cập:
+Local endpoints:
 
-- UI Dashboard: http://localhost:8501
-- Sensor API: http://localhost:8001/sensor/status
-- Enforcer API: http://localhost:8002/enforcer/status
-- ML API: http://localhost:8003/ml/status
-- Orchestrator: http://localhost:8000/status
+| Component | Endpoint |
+| --- | --- |
+| Dashboard | `http://127.0.0.1:8501` |
+| Orchestrator | `http://127.0.0.1:8000/status` |
+| Sensor | `http://127.0.0.1:8001/sensor/status` |
+| Enforcer | `http://127.0.0.1:8002/enforcer/status` |
+| ML service | `http://127.0.0.1:8003/ml/status` |
 
-## Demo (giả lập tấn công)
+To bind to a different interface for an isolated lab environment, set `HOST` and/or `UI_HOST` explicitly. Review the security implications first.
 
-1. Mở UI tại http://localhost:8501
-2. Vào Settings, đảm bảo:
-   - Sensor đang chạy (mode: proc)
-   - Auto-Detect: ON
-   - Action: throttle hoặc kill
+## Demo scenarios
 
-3. Chạy test trong terminal khác:
+The repository includes local test workloads for exercising the detection pipeline:
 
-Test CPU abuse (crypto miner simulation):
+```bash
 python3 tests/test_scripts/test_attacks.py cpu_abuse 30
-
-Test sensitive file access:
 python3 tests/test_scripts/test_attacks.py sensitive_file
-
-Test suspicious execution:
 python3 tests/test_scripts/test_attacks.py suspicious_exec
-
-Test reverse shell:
 python3 tests/test_scripts/test_attacks.py reverse_shell 30
+```
 
-Chạy tất cả tests:
-python3 tests/test_scripts/test_attacks.py all
+These are lab simulations. Run them only on systems you own or are authorized to test.
 
-4. Quan sát kết quả trên UI Dashboard hoặc:
+## Detection coverage
 
-curl -s "http://localhost:8001/sensor/enforcement_history?limit=10" | python3 -m json.tool
+| Scenario | Current signal | Status |
+| --- | --- | --- |
+| Sustained CPU abuse | process metrics + ML/rules | implemented |
+| Sensitive-file access | rule/feature signal | implemented |
+| Execution from suspicious paths | rule signal | implemented |
+| Reverse-shell-like behavior | network/behavior rule | prototype |
+| Large outbound exfiltration | planned eBPF telemetry | not implemented |
 
-## Các loại tấn công phát hiện được
+## Development
 
-| Loại tấn công | Mô tả | Detection |
-|---------------|-------|-----------|
-| CPU Abuse (Crypto Miner) | CPU > 80% kéo dài | Rule + ML |
-| Sensitive File Access | Đọc /etc/shadow, /etc/passwd... | Rule + ML |
-| Suspicious Exec | Thực thi từ /tmp/, /dev/shm/ | Rule |
-| Reverse Shell | Kết nối đến port nghi ngờ (4444, 5555...) | Rule |
-| Data Exfiltration | Gửi lượng lớn dữ liệu ra ngoài | Future (eBPF) |
+Install dependencies and run the tests:
 
-## Lưu ý kỹ thuật
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pytest -q
+```
 
-- Enforcer cần sudo vì ghi vào /sys/fs/cgroup/
-- Hệ thống tự động whitelist các service để tránh tự block
-- Mode proc polling mỗi 0.5s, detect trong khoảng 10s
-- Mode eBPF (future): real-time, hỗ trợ data exfiltration detection
+The CI workflow performs a syntax check and runs the test suite on supported Python versions.
 
-## Phân công công việc
+## Repository layout
 
-| Thành viên | Công việc |
-|------------|-----------|
-| Vũ Văn Nam | Sensor collector (/proc), Schema, CSV exporter |
-| Trần Bình Minh | ML service (train, predict), Feature engineering |
-| Nguyễn Công Sơn | Enforcer (cgroup v2), Scripts, UI, Demo |
+```text
+shared/                 shared schemas and service contracts
+src/sensor/             process collection and event export
+src/ml/                 data generation, training, and inference
+src/enforcer/           cgroup/process enforcement
+src/integration/        API orchestration and Streamlit UI
+tests/                  integration/demo test workloads
+scripts/                local setup and launcher scripts
+```
+
+## Security
+
+The Enforcer can modify cgroups and terminate processes, so its API is intentionally treated as a privileged local control plane. See [`SECURITY.md`](SECURITY.md) before changing bind addresses or deploying the project outside an isolated lab.
+
+If you discover a security issue in the repository itself, please avoid publishing exploit details in a public issue.
 
 ## References
 
-- Linux /proc filesystem: https://man7.org/linux/man-pages/man5/proc.5.html
-- Cgroup v2: https://docs.kernel.org/admin-guide/cgroup-v2.html
-- scikit-learn RandomForest: https://scikit-learn.org/stable/modules/ensemble.html
-- FastAPI: https://fastapi.tiangolo.com/
-- Streamlit: https://streamlit.io/
+- [Linux `/proc` filesystem](https://man7.org/linux/man-pages/man5/proc.5.html)
+- [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+- [scikit-learn ensemble methods](https://scikit-learn.org/stable/modules/ensemble.html)
+- [FastAPI](https://fastapi.tiangolo.com/)
+- [Streamlit](https://streamlit.io/)
