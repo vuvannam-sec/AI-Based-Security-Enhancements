@@ -1,491 +1,319 @@
-"""
-Sensor Service for Intrusion Detection System
-==============================================
-Collects system events via /proc polling or eBPF and provides:
-- Real-time event streaming
-- Auto-detection with ML integration
-- Threat response via Enforcer
-"""
+from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
-import logging
 from collections import deque
-from typing import Optional, Dict, Any, Set
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, Literal, Set
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
 from shared.contracts.sensor_contracts import (
-    SensorStartRequest, SensorStatusResponse, SensorLatestEventsResponse
+    SensorLatestEventsResponse,
+    SensorStartRequest,
+    SensorStatusResponse,
 )
+from shared.security import control_auth_configured, control_headers, require_control_token
 from src.sensor.exporter.csv_exporter import CsvExporter
 from src.sensor.loader.collector import ProcCollector
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger("sensor")
+app = FastAPI(title="Sensor Service", version="1.1")
 
-app = FastAPI(title="Sensor Service", version="1.0")
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-PROTECTED_COMMS = {"streamlit", "uvicorn", "sudo", "su", "pkexec", "polkitd", "systemd", "sshd", "login", "cron"}
-
-ML_URL = os.getenv("ML_URL", "http://localhost:8003")
-ENFORCER_URL = os.getenv("ENFORCER_URL", "http://localhost:8002")
-
-# Detection thresholds (rule-based fallback)
-CPU_THRESHOLD = 80.0  # CPU > 80% triggers rule-based detection
-MEMORY_THRESHOLD = 500 * 1024 * 1024  # > 500MB
-
-# Suspicious ports (reverse shell, C2)
+PROTECTED_COMMS = {
+    "streamlit",
+    "uvicorn",
+    "sudo",
+    "systemd",
+    "sshd",
+    "polkitd",
+    "login",
+    "cron",
+}
+KERNEL_THREADS = {
+    "init",
+    "kthreadd",
+    "kworker",
+    "ksoftirqd",
+    "migration",
+    "watchdog",
+    "rcu_sched",
+    "rcu_bh",
+    "rcu_preempt",
+}
+SENSITIVE_FILES = (
+    "/etc/shadow",
+    "/etc/passwd",
+    "/etc/sudoers",
+    "/etc/ssh",
+    "/root/.ssh",
+)
+SUSPICIOUS_PATHS = ("/tmp/", "/dev/shm/", "/var/tmp/")
 SUSPICIOUS_PORTS = {4444, 5555, 6666, 1234, 1337, 9001, 9999, 31337, 12345}
-
-# Suspicious paths
-SUSPICIOUS_PATHS = ["/tmp/", "/dev/shm/", "/var/tmp/"]
-
-# Shell commands
 SHELL_COMMANDS = {"bash", "sh", "zsh", "dash", "fish", "tcsh", "csh"}
 
-# Kernel threads that should never be killed
-KERNEL_THREADS = {
-    "systemd", "init", "kthreadd", "kworker", "ksoftirqd", 
-    "migration", "watchdog", "rcu_sched", "rcu_bh", "rcu_preempt"
-}
-
-# =============================================================================
-# STATE
-# =============================================================================
+ML_URL = os.getenv("ML_URL", "http://127.0.0.1:8003").rstrip("/")
+ENFORCER_URL = os.getenv("ENFORCER_URL", "http://127.0.0.1:8002").rstrip("/")
+CPU_THRESHOLD = 80.0
+MEMORY_THRESHOLD = 500 * 1024 * 1024
+SUBMIT_COOLDOWN_SEC = 0.5
+CPU_STREAK_REQUIRED = 2
 
 _running = False
 _mode = "proc"
-_thread: Optional[threading.Thread] = None
-_exporter: Optional[CsvExporter] = None
-_last_event_ts: Optional[float] = None
-_buffer: deque = deque(maxlen=1000)
-# Thread-safety
+_thread: threading.Thread | None = None
+_exporter: CsvExporter | None = None
+_last_event_ts: float | None = None
+_buffer: deque[Dict[str, Any]] = deque(maxlen=1000)
 _state_lock = threading.Lock()
 _inflight_pids: Set[int] = set()
 _last_submit_ts: Dict[int, float] = {}
-_SUBMIT_COOLDOWN_SEC = 0.5  # Giảm từ 1.0 xuống 0.5 để phát hiện nhanh hơn
 _cpu_high_streak: Dict[int, int] = {}
-_CPU_STREAK_NEED = 2   # Giảm từ 3 xuống 2 để phát hiện nhanh hơn
-
-# Auto-detect state
 _auto_detect = False
 _auto_action = "throttle"
 _events_scanned = 0
 _threats_detected = 0
 _processes_blocked = 0
 _blocked_pids: Set[int] = set()
-
-# Whitelist: PIDs of our own services
 _whitelisted_pids: Dict[int, str] = {}
-
-# Enforcement history
-_enforcement_history: list = []
-_max_history = 200
-
-# Thread pool for async detection
-_executor = ThreadPoolExecutor(max_workers=4)
+_enforcement_history: deque[Dict[str, Any]] = deque(maxlen=200)
+_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sensor-detect")
 
 
-# =============================================================================
-# STARTUP
-# =============================================================================
-
-@app.on_event("startup")
-def _on_startup():
-    """Initialize sensor service."""
-    my_pid = os.getpid()
-    _whitelist_pid(my_pid, "sensor_service")
-    logger.info(f"Sensor service started (PID: {my_pid})")
-    logger.info(f"ML URL: {ML_URL}")
-    logger.info(f"Enforcer URL: {ENFORCER_URL}")
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
 
 
-# =============================================================================
-# WHITELIST MANAGEMENT
-# =============================================================================
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return default
+
 
 def _whitelist_pid(pid: int, name: str) -> None:
-    """Add PID to whitelist."""
-    _whitelisted_pids[pid] = name
-    logger.info(f"Whitelisted PID {pid} ({name})")
+    with _state_lock:
+        _whitelisted_pids[pid] = name
 
 
 def _unwhitelist_pid(pid: int) -> None:
-    """Remove PID from whitelist."""
-    if pid in _whitelisted_pids:
-        name = _whitelisted_pids.pop(pid)
-        logger.info(f"Removed PID {pid} ({name}) from whitelist")
+    with _state_lock:
+        _whitelisted_pids.pop(pid, None)
 
 
 def _is_whitelisted(pid: int, comm: str) -> bool:
-    """Check if process should be protected from enforcement."""
-    # Protect our own service processes by name
-    if comm and comm.strip() in PROTECTED_COMMS:
+    normalized = comm.strip().lower()
+    if pid <= 2 or pid == os.getpid():
         return True
-    # Own PID
-    if pid == os.getpid():
-        return True
-    
-    # Explicitly whitelisted
     if pid in _whitelisted_pids:
         return True
-    
-    # Kernel threads
-    if comm and comm.strip().lower() in KERNEL_THREADS:
+    if normalized in PROTECTED_COMMS or normalized in KERNEL_THREADS:
         return True
-    
-    # PID 1 and 2 are always protected
-    if pid <= 2:
-        return True
-    
     return False
 
 
-# =============================================================================
-# HISTORY MANAGEMENT
-# =============================================================================
+def _rule_detection(event: Dict[str, Any]) -> str | None:
+    cpu = _safe_float(event.get("cpu_percent"))
+    memory = _safe_int(event.get("memory_bytes"))
+    file_path = str(event.get("file_path") or "")
+    exe_path = str(event.get("exe_path") or "")
+    cmdline = str(event.get("cmdline") or "")
+    comm = str(event.get("comm") or "").lower()
+    dst_port = _safe_int(event.get("dst_port"))
+    io_write_delta = _safe_int(event.get("io_write_delta"))
 
-def _add_to_history(entry: Dict[str, Any]) -> None:
-    global _enforcement_history
-    with _state_lock:
-        _enforcement_history.append(entry)
-        if len(_enforcement_history) > _max_history:
-            _enforcement_history = _enforcement_history[-_max_history:]
+    if cpu > CPU_THRESHOLD:
+        return "high_cpu_usage"
+    if memory > MEMORY_THRESHOLD:
+        return "high_memory_usage"
+    if file_path and any(path in file_path for path in SENSITIVE_FILES):
+        return "sensitive_file_access"
+    if dst_port in SUSPICIOUS_PORTS:
+        return "reverse_shell"
+    if event.get("is_exfiltration") or (event.get("has_network") and io_write_delta > 10 * 1024 * 1024):
+        return "data_exfiltration"
+    if comm in SHELL_COMMANDS and dst_port > 0:
+        return "reverse_shell"
+    if any(path in exe_path or path in cmdline for path in SUSPICIOUS_PATHS):
+        return "suspicious_exec"
+    return None
 
 
-# =============================================================================
-# AUTO-DETECTION LOGIC
-# =============================================================================
+def _ml_detection(event: Dict[str, Any]) -> tuple[str | None, float, int]:
+    try:
+        with httpx.Client(timeout=2.0) as client:
+            response = client.post(f"{ML_URL}/ml/predict", json={"event": event})
+        if response.status_code != 200:
+            return None, 0.0, 0
+        result = response.json()
+        if not result.get("ok"):
+            return None, 0.0, 0
+        score = _safe_float(result.get("score"))
+        label = _safe_int(result.get("label"))
+        action = str(result.get("action") or "allow").lower()
+        if action == "block":
+            return str(result.get("threat_type") or "ml_detected"), score, label
+        return None, score, label
+    except httpx.HTTPError:
+        logger.debug("ML service unavailable", exc_info=True)
+        return None, 0.0, 0
+
+
+def _enforce(pid: int, action: str) -> tuple[bool, str | None]:
+    payload: Dict[str, Any] = {"pid": pid, "action": action}
+    if action == "throttle":
+        payload.update(cpu_max="5000 100000", memory_max=128 * 1024 * 1024)
+
+    try:
+        with httpx.Client(timeout=3.0) as client:
+            response = client.post(
+                f"{ENFORCER_URL}/enforcer/action",
+                json=payload,
+                headers=control_headers(),
+            )
+        if response.status_code == 200:
+            return True, None
+        return False, f"enforcer returned HTTP {response.status_code}"
+    except httpx.HTTPError as exc:
+        return False, type(exc).__name__
+
 
 def _do_auto_detect(event: Dict[str, Any]) -> None:
-    """
-    Analyze event for threats using ML and rule-based detection.
-    Called asynchronously for each event when auto_detect is enabled.
-    """
     global _events_scanned, _threats_detected, _processes_blocked
 
-    # ---------- normalize pid ----------
-    pid_raw = event.get("pid")
-    if pid_raw is None:
+    pid = _safe_int(event.get("pid"), default=-1)
+    if pid <= 2:
         return
-    try:
-        pid = int(pid_raw)
-    except Exception:
-        return
+    comm = str(event.get("comm") or "")
 
-    comm = str(event.get("comm", ""))
-
-    # ---------- claim pid (avoid double-processing) + update scanned ----------
     with _state_lock:
-        if _is_whitelisted(pid, comm):
+        if _is_whitelisted(pid, comm) or pid in _blocked_pids or pid in _inflight_pids:
             return
-        if pid in _blocked_pids:
-            return
-        if pid in _inflight_pids:
-            return
-
         _inflight_pids.add(pid)
         _events_scanned += 1
 
     try:
-        # ---------- read event fields ----------
-        try:
-            cpu_percent = float(event.get("cpu_percent", 0) or 0)
-        except Exception:
-            cpu_percent = 0.0
+        threat_type, ml_score, ml_label = _ml_detection(event)
+        method = "ml" if threat_type else None
+        if not threat_type:
+            threat_type = _rule_detection(event)
+            method = "rule" if threat_type else None
+        if not threat_type:
+            return
 
-        try:
-            memory_bytes = int(event.get("memory_bytes", 0) or 0)
-        except Exception:
-            memory_bytes = 0
+        with _state_lock:
+            _threats_detected += 1
 
-        exe_path = str(event.get("exe_path", "") or "")
-        file_path = str(event.get("file_path", "") or "")
-        syscall_name = str(event.get("syscall_name", "") or "")
-        cmdline = str(event.get("cmdline", "") or "")
-        dst_port = int(event.get("dst_port", 0) or 0)
+        success, error = _enforce(pid, _auto_action)
+        entry = {
+            "timestamp": time.time(),
+            "pid": pid,
+            "comm": comm,
+            "exe_path": str(event.get("exe_path") or ""),
+            "cmdline": str(event.get("cmdline") or "")[:100],
+            "cpu_percent": round(_safe_float(event.get("cpu_percent")), 1),
+            "memory_bytes": _safe_int(event.get("memory_bytes")),
+            "file_path": str(event.get("file_path") or ""),
+            "syscall_name": str(event.get("syscall_name") or ""),
+            "dst_port": _safe_int(event.get("dst_port")),
+            "threat_type": threat_type,
+            "detection_method": method,
+            "ml_score": round(ml_score, 3),
+            "ml_label": ml_label,
+            "enforcer_action": _auto_action,
+            "status": "success" if success else "failed",
+            "error": error,
+        }
+        _enforcement_history.append(entry)
 
-        # ---------- detection result ----------
-        is_threat = False
-        threat_type = None
-        detection_method = None
-        ml_score = 0.0
-        ml_label = 0
-
-        # ===================
-        # ML-BASED DETECTION
-        # ===================
-        try:
-            with httpx.Client(timeout=2.0) as client:
-                response = client.post(f"{ML_URL}/ml/predict", json={"event": event})
-
-            if response.status_code == 200:
-                result = response.json()
-                if result.get("ok"):
-                    ml_label = int(result.get("label", 0) or 0)
-                    ml_score = float(result.get("score", 0) or 0)
-                    ml_action = str(result.get("action", "allow") or "allow")
-                    ml_threat_type = result.get("threat_type")
-
-                    if ml_score is not None and ml_score >= 0.90:
-                        is_threat = True
-                        threat_type = ml_threat_type or "ml_detected"
-                        detection_method = "ml"
-                        logger.info(
-                            f"[ML] Threat detected: PID={pid}, comm={comm}, "
-                            f"type={threat_type}, score={ml_score:.3f}"
-                        )
-        except httpx.TimeoutException:
-            logger.debug(f"ML timeout for PID {pid}")
-        except Exception as e:
-            logger.debug(f"ML error for PID {pid}: {e}")
-
-        # ========================
-        # RULE-BASED DETECTION
-        # ========================
-        if not is_threat:
-            # High CPU (crypto miner)
-            if cpu_percent > CPU_THRESHOLD:
-                is_threat = True
-                threat_type = "high_cpu_usage"
-                detection_method = "rule"
-                logger.info(f"[RULE] High CPU: PID={pid}, comm={comm}, cpu={cpu_percent:.1f}%")
-            
-            # High Memory
-            elif memory_bytes > MEMORY_THRESHOLD:
-                is_threat = True
-                threat_type = "high_memory_usage"
-                detection_method = "rule"
-                logger.info(f"[RULE] High memory: PID={pid}, comm={comm}, mem={memory_bytes/(1024*1024):.1f}MB")
-            
-            # Sensitive file access
-            elif file_path and any(s in file_path for s in ["/etc/shadow", "/etc/passwd", "/etc/sudoers", "/etc/ssh", "/root/.ssh"]):
-                is_threat = True
-                threat_type = "sensitive_file_access"
-                detection_method = "rule"
-                logger.info(f"[RULE] Sensitive file: PID={pid}, comm={comm}, file={file_path}")
-            
-            # Suspicious port (reverse shell)
-            elif dst_port in SUSPICIOUS_PORTS:
-                is_threat = True
-                threat_type = "reverse_shell"
-                detection_method = "rule"
-                logger.info(f"[RULE] Suspicious port: PID={pid}, comm={comm}, port={dst_port}")
-            
-            # Data exfiltration - large io_write with network connection
-            elif event.get("is_exfiltration") or (
-                event.get("has_network") and event.get("io_write_delta", 0) > 10 * 1024 * 1024
-            ):
-                is_threat = True
-                threat_type = "data_exfiltration"
-                detection_method = "rule"
-                logger.warning(
-                    f"[RULE] Data exfiltration: PID={pid}, comm={comm}, "
-                    f"io_write_delta={event.get('io_write_delta', 0)}"
-                )
-            # Shell with network connection
-            elif comm in SHELL_COMMANDS and dst_port > 0:
-                is_threat = True
-                threat_type = "reverse_shell"
-                detection_method = "rule"
-                logger.info(f"[RULE] Shell with network: PID={pid}, comm={comm}, port={dst_port}")
-            
-            # Execution from /tmp or /dev/shm (check both exe_path AND cmdline)
-            elif any(p in exe_path for p in SUSPICIOUS_PATHS) or any(p in cmdline for p in SUSPICIOUS_PATHS):
-                is_threat = True
-                threat_type = "suspicious_exec"
-                detection_method = "rule"
-                logger.info(f"[RULE] Suspicious exec: PID={pid}, comm={comm}, exe={exe_path}, cmdline={cmdline[:50]}")
-
-        # ===================
-        # TAKE ACTION
-        # ===================
-        if is_threat:
+        if success:
             with _state_lock:
-                _threats_detected += 1
-
-            history_entry = {
-                "timestamp": time.time(),
-                "pid": pid,
-                "comm": comm,
-                "exe_path": exe_path,
-                "cmdline": cmdline[:100],  # Thêm cmdline vào history
-                "cpu_percent": round(cpu_percent, 1),
-                "memory_bytes": memory_bytes,
-                "file_path": file_path,
-                "syscall_name": syscall_name,
-                "dst_port": dst_port,  # Thêm dst_port vào history
-                "threat_type": threat_type,
-                "detection_method": detection_method,
-                "ml_score": round(ml_score, 3),
-                "ml_label": ml_label,
-                "enforcer_action": _auto_action,
-                "status": "pending",
-                "error": None,
-            }
-
-            success = False
-
-            # Call Enforcer
-            try:
-                with httpx.Client(timeout=3.0) as client:
-                    payload = {
-                        "pid": pid,
-                        "action": _auto_action,
-                    }
-
-                    if _auto_action == "throttle":
-                        payload["cpu_max"] = "5000 100000"  # 5% CPU limit
-                        payload["memory_max"] = 128 * 1024 * 1024  # 128MB limit
-
-                    response = client.post(
-                        f"{ENFORCER_URL}/enforcer/action",
-                        json=payload,
-                    )
-
-                if response.status_code == 200:
-                    success = True
-                    history_entry["status"] = "success"
-                    logger.warning(
-                        f"[ENFORCER] {_auto_action.upper()} PID={pid} ({comm}) - Threat: {threat_type}"
-                    )
-                else:
-                    history_entry["status"] = "failed"
-                    history_entry["error"] = response.text[:200]
-                    logger.error(f"[ENFORCER] Failed for PID={pid}: {response.text}")
-
-            except httpx.TimeoutException:
-                history_entry["status"] = "timeout"
-                history_entry["error"] = "Enforcer timeout"
-            except Exception as e:
-                history_entry["status"] = "error"
-                history_entry["error"] = str(e)[:200]
-
-            if success:
-                with _state_lock:
-                    _processes_blocked += 1
-                    _blocked_pids.add(pid)
-                    _cpu_high_streak.pop(pid, None)
-                    _last_submit_ts.pop(pid, None)
-
-            _add_to_history(history_entry)
-
+                _processes_blocked += 1
+                _blocked_pids.add(pid)
+                _cpu_high_streak.pop(pid, None)
+                _last_submit_ts.pop(pid, None)
+            logger.warning("%s PID %s (%s): %s", _auto_action, pid, comm, threat_type)
     finally:
-        # release inflight pid
         with _state_lock:
             _inflight_pids.discard(pid)
 
 
-# =============================================================================
-# EVENT PROCESSING
-# =============================================================================
-
 def _process_event(event: Dict[str, Any]) -> None:
-    """Process collected event: buffer, export, and optionally detect."""
     global _last_event_ts
 
-    _last_event_ts = event.get("timestamp", time.time())
+    _last_event_ts = _safe_float(event.get("timestamp"), time.time())
     _buffer.append(event)
-
     if _exporter:
         _exporter.append(event)
-
     if not _auto_detect:
         return
 
-    # ---- Filter + cooldown to avoid ThreadPool backlog ----
-    pid = event.get("pid")
-    try:
-        pid = int(pid)
-    except Exception:
+    pid = _safe_int(event.get("pid"), default=-1)
+    if pid <= 2:
         return
 
-    # Get event fields for filtering
-    try:
-        cpu = float(event.get("cpu_percent", 0) or 0)
-    except Exception:
-        cpu = 0.0
+    cpu = _safe_float(event.get("cpu_percent"))
+    memory = _safe_int(event.get("memory_bytes"))
+    file_path = str(event.get("file_path") or "")
+    exe_path = str(event.get("exe_path") or "")
+    cmdline = str(event.get("cmdline") or "")
+    dst_port = _safe_int(event.get("dst_port"))
+    comm = str(event.get("comm") or "").lower()
 
-    try:
-        mem = int(event.get("memory_bytes", 0) or 0)
-    except Exception:
-        mem = 0
-
-    has_sensitive_file = bool(event.get("file_path"))
-    exe_path = str(event.get("exe_path", "") or "")
-    cmdline = str(event.get("cmdline", "") or "")
-    dst_port = int(event.get("dst_port", 0) or 0)
-    comm = str(event.get("comm", "") or "")
-
-    # --- CPU streak logic: require sustained high CPU ---
     with _state_lock:
-        if cpu > CPU_THRESHOLD:
-            _cpu_high_streak[pid] = _cpu_high_streak.get(pid, 0) + 1
-        else:
-            _cpu_high_streak[pid] = 0
+        _cpu_high_streak[pid] = _cpu_high_streak.get(pid, 0) + 1 if cpu > CPU_THRESHOLD else 0
+        cpu_sustained = _cpu_high_streak[pid] >= CPU_STREAK_REQUIRED
 
-    cpu_sustained = _cpu_high_streak.get(pid, 0) >= _CPU_STREAK_NEED
-
-    # Check suspicious conditions
-    has_suspicious_exec = (
-        any(p in exe_path for p in SUSPICIOUS_PATHS) or
-        any(p in cmdline for p in SUSPICIOUS_PATHS)
-    )
-    has_suspicious_port = dst_port in SUSPICIOUS_PORTS
-    has_shell_network = comm in SHELL_COMMANDS and dst_port > 0
-
-    # criteria: multiple suspicious indicators
     suspicious = (
-        cpu_sustained or 
-        (mem > MEMORY_THRESHOLD) or 
-        has_sensitive_file or
-        has_suspicious_exec or
-        has_suspicious_port or
-        has_shell_network
+        cpu_sustained
+        or memory > MEMORY_THRESHOLD
+        or any(path in file_path for path in SENSITIVE_FILES)
+        or any(path in exe_path or path in cmdline for path in SUSPICIOUS_PATHS)
+        or dst_port in SUSPICIOUS_PORTS
+        or (comm in SHELL_COMMANDS and dst_port > 0)
+        or bool(event.get("is_exfiltration"))
     )
     if not suspicious:
         return
 
     now = time.time()
     with _state_lock:
-        last = _last_submit_ts.get(pid, 0.0)
-        if now - last < _SUBMIT_COOLDOWN_SEC:
+        if now - _last_submit_ts.get(pid, 0.0) < SUBMIT_COOLDOWN_SEC:
             return
         _last_submit_ts[pid] = now
-
     _executor.submit(_do_auto_detect, event.copy())
 
 
-def _runner_proc(sample_interval: float):
-    """Run /proc-based collection loop."""
+def _runner_proc(sample_interval: float) -> None:
     global _running
     collector = ProcCollector(sample_interval=sample_interval)
-    
     for event in collector.stream():
         if not _running:
             break
         _process_event(event)
 
 
-# =============================================================================
-# API ENDPOINTS
-# =============================================================================
+@app.on_event("startup")
+def _on_startup() -> None:
+    _whitelist_pid(os.getpid(), "sensor_service")
+    logger.info("sensor service started with /proc collector support")
+
+
+@app.on_event("shutdown")
+def _on_shutdown() -> None:
+    global _running
+    _running = False
+
 
 @app.get("/sensor/status", response_model=SensorStatusResponse)
-def status():
-    """Get sensor service status."""
+def status() -> SensorStatusResponse:
     return SensorStatusResponse(
         running=_running,
         mode=_mode,
@@ -499,22 +327,19 @@ def status():
     )
 
 
-@app.post("/sensor/start")
-def start(req: SensorStartRequest):
-    """Start event collection."""
+@app.get("/sensor/security")
+def security_status() -> Dict[str, Any]:
+    return {"control_auth_configured": control_auth_configured()}
+
+
+@app.post("/sensor/start", dependencies=[Depends(require_control_token)])
+def start(req: SensorStartRequest) -> Dict[str, Any]:
     global _running, _mode, _thread, _exporter, _auto_detect, _auto_action
-    global _events_scanned, _threats_detected, _processes_blocked, _blocked_pids
-    
+    global _events_scanned, _threats_detected, _processes_blocked
+
     if _running:
-        return {"ok": True, "message": "Already running"}
-    
-    if req.mode not in ("proc", "ebpf"):
-        raise HTTPException(status_code=400, detail="mode must be 'proc' or 'ebpf'")
-    
-    if req.auto_action not in ("kill", "throttle"):
-        raise HTTPException(status_code=400, detail="auto_action must be 'kill' or 'throttle'")
-    
-    # Reset state
+        return {"ok": True, "message": "already running"}
+
     _mode = req.mode
     _auto_detect = req.auto_detect
     _auto_action = req.auto_action
@@ -523,34 +348,12 @@ def start(req: SensorStartRequest):
     _processes_blocked = 0
     _blocked_pids.clear()
     _cpu_high_streak.clear()
-    
-    # Initialize exporter
+    _last_submit_ts.clear()
     _exporter = CsvExporter(out_dir="data/raw")
     _running = True
-    
-    # Start collection thread
-    if _mode == "proc":
-        _thread = threading.Thread(
-            target=_runner_proc, 
-            args=(req.sample_interval,), 
-            daemon=True
-        )
-    else:
-        if os.geteuid() != 0:
-            _running = False
-            raise HTTPException(
-                status_code=403, 
-                detail="eBPF mode requires root privileges"
-            )
-        raise HTTPException(status_code=501, detail="eBPF mode not yet implemented")
-    
+    _thread = threading.Thread(target=_runner_proc, args=(req.sample_interval,), daemon=True)
     _thread.start()
-    
-    logger.info(
-        f"Sensor started: mode={_mode}, interval={req.sample_interval}s, "
-        f"auto_detect={_auto_detect}, action={_auto_action}"
-    )
-    
+
     return {
         "ok": True,
         "mode": _mode,
@@ -561,19 +364,12 @@ def start(req: SensorStartRequest):
     }
 
 
-@app.post("/sensor/stop")
-def stop():
-    """Stop event collection."""
+@app.post("/sensor/stop", dependencies=[Depends(require_control_token)])
+def stop() -> Dict[str, Any]:
     global _running
-    
     _running = False
-    time.sleep(0.2)
-    
-    logger.info(
-        f"Sensor stopped. Stats: scanned={_events_scanned}, "
-        f"threats={_threats_detected}, blocked={_processes_blocked}"
-    )
-    
+    if _thread and _thread.is_alive():
+        _thread.join(timeout=2.0)
     return {
         "ok": True,
         "events_scanned": _events_scanned,
@@ -583,15 +379,13 @@ def stop():
 
 
 @app.get("/sensor/events/latest", response_model=SensorLatestEventsResponse)
-def get_latest_events(limit: int = 100):
-    """Get latest collected events."""
+def get_latest_events(limit: int = 100) -> SensorLatestEventsResponse:
     limit = max(1, min(limit, 1000))
     return SensorLatestEventsResponse(events=list(_buffer)[-limit:])
 
 
 @app.get("/sensor/stats")
-def get_stats():
-    """Get detection statistics."""
+def get_stats() -> Dict[str, Any]:
     return {
         "running": _running,
         "auto_detect": _auto_detect,
@@ -599,86 +393,60 @@ def get_stats():
         "events_scanned": _events_scanned,
         "threats_detected": _threats_detected,
         "processes_blocked": _processes_blocked,
-        "blocked_pids": list(_blocked_pids),
+        "blocked_pids": sorted(_blocked_pids),
         "buffer_size": len(_buffer),
     }
 
 
-# =============================================================================
-# WHITELIST ENDPOINTS
-# =============================================================================
-
 class WhitelistRequest(BaseModel):
-    pid: int
-    name: str = "unknown"
-    action: str = "add"
+    pid: int = Field(gt=2)
+    name: str = Field(default="unknown", min_length=1, max_length=80)
+    action: Literal["add", "remove"] = "add"
 
 
 @app.get("/sensor/whitelist")
-def get_whitelist():
-    """Get current whitelist."""
+def get_whitelist() -> Dict[str, Any]:
+    with _state_lock:
+        whitelist = _whitelisted_pids.copy()
     return {
-        "whitelisted_pids": _whitelisted_pids.copy(),
-        "kernel_threads": list(KERNEL_THREADS),
+        "whitelisted_pids": whitelist,
+        "kernel_threads": sorted(KERNEL_THREADS),
         "sensor_pid": os.getpid(),
     }
 
 
-@app.post("/sensor/whitelist")
-def manage_whitelist(req: WhitelistRequest):
-    """Add or remove PID from whitelist."""
+@app.post("/sensor/whitelist", dependencies=[Depends(require_control_token)])
+def manage_whitelist(req: WhitelistRequest) -> Dict[str, Any]:
     if req.action == "add":
         _whitelist_pid(req.pid, req.name)
         return {"ok": True, "action": "added", "pid": req.pid, "name": req.name}
-    elif req.action == "remove":
-        _unwhitelist_pid(req.pid)
-        return {"ok": True, "action": "removed", "pid": req.pid}
-    else:
-        raise HTTPException(status_code=400, detail="action must be 'add' or 'remove'")
+    _unwhitelist_pid(req.pid)
+    return {"ok": True, "action": "removed", "pid": req.pid}
 
-
-# =============================================================================
-# AUTO-DETECT CONTROL
-# =============================================================================
 
 class AutoDetectRequest(BaseModel):
     enabled: bool
-    action: str = "throttle"
+    action: Literal["kill", "throttle"] = "throttle"
 
 
-@app.post("/sensor/auto_detect")
-def set_auto_detect(req: AutoDetectRequest):
-    """Toggle auto-detect at runtime."""
+@app.post("/sensor/auto_detect", dependencies=[Depends(require_control_token)])
+def set_auto_detect(req: AutoDetectRequest) -> Dict[str, Any]:
     global _auto_detect, _auto_action
-    
-    if req.action not in ("kill", "throttle"):
-        raise HTTPException(status_code=400, detail="action must be 'kill' or 'throttle'")
-    
-    old_state = _auto_detect
+    changed = req.enabled != _auto_detect
     _auto_detect = req.enabled
     _auto_action = req.action
-    
-    status_str = "ENABLED" if _auto_detect else "DISABLED"
-    logger.info(f"Auto-detect {status_str} (action: {_auto_action})")
-    
     return {
         "ok": True,
         "auto_detect": _auto_detect,
         "auto_action": _auto_action,
-        "changed": old_state != _auto_detect,
+        "changed": changed,
     }
 
 
-# =============================================================================
-# HISTORY ENDPOINT
-# =============================================================================
-
 @app.get("/sensor/enforcement_history")
-def get_enforcement_history(limit: int = 50):
-    """Get history of detected threats and actions."""
-    limit = max(1, min(limit, _max_history))
-    history = list(reversed(_enforcement_history[-limit:]))
-    
+def get_enforcement_history(limit: int = 50) -> Dict[str, Any]:
+    limit = max(1, min(limit, _enforcement_history.maxlen or 200))
+    history = list(reversed(list(_enforcement_history)[-limit:]))
     return {
         "ok": True,
         "count": len(history),
@@ -687,26 +455,13 @@ def get_enforcement_history(limit: int = 50):
     }
 
 
-# =============================================================================
-# MANUAL DETECTION ENDPOINT
-# =============================================================================
-
 @app.post("/sensor/analyze")
-def analyze_event(event: Dict[str, Any]):
-    """
-    Manually analyze a single event without taking action.
-    Useful for testing detection logic.
-    """
+def analyze_event(event: Dict[str, Any]) -> Dict[str, Any]:
     try:
         with httpx.Client(timeout=5.0) as client:
-            response = client.post(
-                f"{ML_URL}/ml/predict",
-                json={"event": event}
-            )
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                return {"ok": False, "error": response.text}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+            response = client.post(f"{ML_URL}/ml/predict", json={"event": event})
+        if response.status_code == 200:
+            return response.json()
+        return {"ok": False, "error": f"ML returned HTTP {response.status_code}"}
+    except httpx.HTTPError as exc:
+        return {"ok": False, "error": type(exc).__name__}

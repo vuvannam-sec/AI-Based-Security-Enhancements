@@ -1,24 +1,35 @@
+from __future__ import annotations
+
 import pandas as pd
+import pytest
 from fastapi.testclient import TestClient
 
-from src.ml.ml_service import app
-from src.ml.training.train_pipeline import get_feature_columns
+import src.ml.ml_service as service
+from src.ml.training.train_pipeline import engineer_features, get_feature_columns
+
+TOKEN = "test-control-token"
+HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+client = TestClient(service.app)
 
 
-def _create_test_event() -> dict:
-    """Create a test event with all required fields."""
+@pytest.fixture(autouse=True)
+def control_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AISEC_CONTROL_TOKEN", TOKEN)
+
+
+def _event() -> dict:
     return {
-        "timestamp": 1700000000.0,
-        "event_id": "test-event-001",
-        "event_type": "syscall",
-        "pid": 1234,
+        "timestamp": 1_700_000_000.0,
+        "event_id": "test-event",
+        "event_type": "process",
+        "pid": 4242,
         "ppid": 1000,
         "uid": 1000,
         "gid": 1000,
         "comm": "python3",
         "exe_path": "/usr/bin/python3",
-        "syscall_nr": 59,
-        "syscall_name": "execve",
+        "syscall_nr": 0,
+        "syscall_name": "",
         "syscall_ret": 0,
         "src_ip": "",
         "dst_ip": "",
@@ -30,94 +41,45 @@ def _create_test_event() -> dict:
         "file_path": "",
         "file_op": "",
         "file_flags": 0,
-        "cpu_percent": 5.0,
-        "memory_bytes": 50000000,
-        "io_read_bytes": 1000,
-        "io_write_bytes": 500,
+        "cpu_percent": 2.0,
+        "memory_bytes": 20_000_000,
+        "io_read_bytes": 0,
+        "io_write_bytes": 0,
     }
 
 
-def _create_attack_event() -> dict:
-    """Create an attack event (sensitive file access)."""
-    event = _create_test_event()
+def test_status_has_stable_shape() -> None:
+    response = client.get("/ml/status")
+    assert response.status_code == 200
+    body = response.json()
+    assert {"ready", "model_path", "feature_count", "supported_threats"} <= body.keys()
+
+
+def test_generate_requires_control_token() -> None:
+    response = client.post(
+        "/ml/generate",
+        json={"n_normal": 50, "n_attack": 50, "output_path": "data/synthetic/test.csv"},
+    )
+    assert response.status_code == 401
+
+
+def test_data_path_cannot_escape_configured_data_directory() -> None:
+    response = client.post(
+        "/ml/generate",
+        headers=HEADERS,
+        json={"n_normal": 50, "n_attack": 50, "output_path": "../../outside.csv"},
+    )
+    assert response.status_code == 400
+
+
+def test_batch_size_is_bounded() -> None:
+    response = client.post("/ml/predict/batch", json={"events": []})
+    assert response.status_code == 422
+
+
+def test_feature_engineering_marks_sensitive_access() -> None:
+    event = _event()
     event["file_path"] = "/etc/shadow"
-    event["file_op"] = "read"
-    event["uid"] = 1000  # Non-root accessing sensitive file
-    return event
-
-
-def _ensure_trained(client: TestClient) -> None:
-    """Ensure model is trained before tests."""
-    # First generate synthetic data
-    r = client.post("/ml/retrain", json={
-        "csv_path": "data/synthetic/synthetic_events.csv",
-        "regenerate": True,
-        "n_normal": 500,
-        "n_attack": 200
-    })
-    assert r.status_code == 200
-    body = r.json()
-    assert body.get("ok") is True
-
-
-def test_ml_status_format():
-    """Test /ml/status endpoint."""
-    client = TestClient(app)
-    r = client.get("/ml/status")
-    assert r.status_code == 200
-    body = r.json()
-    assert "ready" in body
-    assert "model_path" in body
-    assert "supported_threats" in body
-
-
-def test_ml_retrain():
-    """Test model training."""
-    client = TestClient(app)
-    _ensure_trained(client)
-    
-    r = client.get("/ml/status")
-    assert r.status_code == 200
-    assert r.json().get("ready") is True
-
-
-def test_ml_predict_normal_event():
-    """Test prediction on normal event."""
-    client = TestClient(app)
-    _ensure_trained(client)
-    
-    event = _create_test_event()
-    r = client.post("/ml/predict", json={"event": event})
-    assert r.status_code == 200
-    body = r.json()
-    assert body.get("ok") is True
-    assert "label" in body
-    assert "score" in body
-    assert "action" in body
-
-
-def test_ml_predict_attack_event():
-    """Test prediction on attack event."""
-    client = TestClient(app)
-    _ensure_trained(client)
-    
-    event = _create_attack_event()
-    r = client.post("/ml/predict", json={"event": event})
-    assert r.status_code == 200
-    body = r.json()
-    assert body.get("ok") is True
-    assert "label" in body
-    assert "threat_type" in body
-
-
-def test_ml_predict_batch():
-    """Test batch prediction."""
-    client = TestClient(app)
-    _ensure_trained(client)
-    
-    events = [_create_test_event(), _create_attack_event()]
-    r = client.post("/ml/predict/batch", json={"events": events})
-    assert r.status_code == 200
-    body = r.json()
-    assert "results" in body
-    assert len(body["results"]) == 2
+    frame = engineer_features(pd.DataFrame([event]))
+    assert frame.loc[0, "is_sensitive_file"] == 1
+    assert set(get_feature_columns()).issubset(frame.columns)

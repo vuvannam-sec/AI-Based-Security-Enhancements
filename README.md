@@ -1,65 +1,90 @@
 # AI-Based Security Enhancements
 
-A Linux host-monitoring prototype that combines process telemetry, lightweight machine-learning classification, policy-based detection, and cgroup-based response.
+A Linux host-behavior monitoring prototype that combines `/proc` telemetry, lightweight machine-learning classification, rule-based signals, and cgroup-backed response.
 
-The project is intended for local experimentation and operating-systems/security coursework. It is not a production endpoint-protection product.
+The project is designed for local security research, operating-systems experimentation, and reproducible demonstrations. It is **not** an endpoint-protection product and should not be treated as a production security boundary.
 
-## What it does
-
-The system is split into five small services:
-
-- **Sensor** — samples process activity from Linux `/proc` and produces a shared event schema.
-- **ML service** — classifies events with a scikit-learn pipeline trained on generated data.
-- **Enforcer** — applies CPU/memory limits through Linux cgroups or terminates a selected process.
-- **Orchestrator** — sends events through classification and optional enforcement.
-- **Dashboard** — exposes service status, detections, and demo controls through Streamlit.
+## Architecture
 
 ```text
-/proc
-  |
-  v
-Sensor ---> ML service ---> Orchestrator ---> Enforcer
-  |                                |
-  +--------------------------------+----> Dashboard
+                  read-only telemetry
+                       /proc
+                         |
+                         v
+                    +---------+
+                    | Sensor  |
+                    +----+----+
+                         |
+               event     |      prediction
+                         +-----------> +------------+
+                         |             | ML service |
+                         |             +------------+
+                         |
+                         v
+                  +-------------+
+                  | Orchestrator|
+                  +------+------+
+                         |
+                         | authenticated control request
+                         v
+                    +---------+
+                    |Enforcer |
+                    +----+----+
+                         |
+                    cgroup / signal
+                         |
+                         v
+                   Linux processes
+
+              Streamlit UI -> local service APIs
 ```
 
-## Project status
+The Sensor and ML service produce decisions; the Enforcer is the privileged control plane. Mutating endpoints require a shared bearer token, and the bundled launcher binds every service to loopback by default.
 
-This repository is a working research/teaching prototype. The current implementation uses `/proc` polling and synthetic training data. Detection quality therefore should not be interpreted as a real-world security benchmark.
+A deeper description of the data flow and trust boundaries is in [`docs/architecture.md`](docs/architecture.md).
 
-Known limitations:
+## Current scope
 
-- process telemetry is sampled rather than event-driven;
-- the training set is synthetic;
-- there is no authentication layer between local services;
-- enforcement requires elevated privileges;
-- data-exfiltration detection and eBPF collection are not implemented yet.
+Implemented:
+
+- Linux process sampling from `/proc`;
+- normalized event records and CSV export;
+- RandomForest training and inference over generated data;
+- rule-assisted detection for selected host behaviors;
+- CPU and memory throttling through cgroups;
+- explicit process termination through the Enforcer;
+- local dashboard, service status, detection history, and manual controls;
+- authenticated local control operations;
+- automated syntax, lint, and unit/service tests in GitHub Actions.
+
+Not implemented or not production-ready:
+
+- eBPF event collection;
+- production-quality training data or calibrated detection metrics;
+- TLS, user accounts, RBAC, or remote multi-host management;
+- tamper resistance or isolation from a compromised root account;
+- a hardened deployment model for Internet-facing use.
+
+The generated training set is useful for exercising the pipeline, not for making claims about real-world detection accuracy.
 
 ## Requirements
 
-- Linux with `/proc` available (Ubuntu 22.04+ recommended)
-- Python 3.10+
-- cgroup v2 preferred; limited cgroup v1 fallback is included
-- `sudo` for the Enforcer service
+- Linux with `/proc` available (Ubuntu 22.04+ is a practical baseline);
+- Python 3.10+;
+- cgroup v2 preferred, with a limited cgroup v1 fallback;
+- `sudo` for the Enforcer service.
 
-The default launcher binds services to `127.0.0.1`. Do not expose the privileged Enforcer API to an untrusted network.
-
-## Setup
+## Quick start
 
 ```bash
 git clone https://github.com/vuvannam-sec/AI-Based-Security-Enhancements.git
 cd AI-Based-Security-Enhancements
 chmod +x scripts/*.sh
 ./scripts/setup_and_train.sh
-```
-
-Setup creates a local virtual environment, generates synthetic events, and trains the classifier. Generated datasets and model artifacts are intentionally excluded from Git.
-
-## Run
-
-```bash
 ./scripts/run_all.sh
 ```
+
+The launcher generates an ephemeral `AISEC_CONTROL_TOKEN` when one is not already set, exports it to the local services, and does not print it. Services bind to `127.0.0.1` unless explicitly overridden.
 
 Local endpoints:
 
@@ -71,61 +96,77 @@ Local endpoints:
 | Enforcer | `http://127.0.0.1:8002/enforcer/status` |
 | ML service | `http://127.0.0.1:8003/ml/status` |
 
-To bind to a different interface for an isolated lab environment, set `HOST` and/or `UI_HOST` explicitly. Review the security implications first.
+To run services manually, set one shared token first:
+
+```bash
+export AISEC_CONTROL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+```
+
+Mutating API calls use:
+
+```text
+Authorization: Bearer <AISEC_CONTROL_TOKEN>
+```
+
+The token is a local control-plane guard, not a substitute for TLS or network isolation. Do not bind the privileged Enforcer to an untrusted interface. See [`SECURITY.md`](SECURITY.md).
+
+## Detection pipeline
+
+The current pipeline intentionally combines two mechanisms:
+
+1. **ML scoring** — the model classifies normalized process events and returns an attack score and action recommendation.
+2. **Rule fallback** — a small set of explicit behavioral signals catches cases such as sustained high CPU, selected sensitive-file access, suspicious execution paths, and shell/network combinations.
+
+Automatic enforcement is considered only after the Sensor's pre-filter, protected-process checks, cooldown, and final detection decision. The Enforcer independently validates the target PID and resource limits before changing process state.
 
 ## Demo scenarios
 
-The repository includes local test workloads for exercising the detection pipeline:
+Manual demos live outside the pytest suite so CI never runs stress or process-behavior simulations accidentally.
 
 ```bash
-python3 tests/test_scripts/test_attacks.py cpu_abuse 30
-python3 tests/test_scripts/test_attacks.py sensitive_file
-python3 tests/test_scripts/test_attacks.py suspicious_exec
-python3 tests/test_scripts/test_attacks.py reverse_shell 30
+python3 scripts/demo_scenarios.py cpu --duration 20
+python3 scripts/demo_scenarios.py sensitive-file --duration 10
+python3 scripts/demo_scenarios.py suspicious-exec --duration 10
+python3 scripts/demo_scenarios.py suspicious-network --duration 10
 ```
 
-These are lab simulations. Run them only on systems you own or are authorized to test.
-
-## Detection coverage
-
-| Scenario | Current signal | Status |
-| --- | --- | --- |
-| Sustained CPU abuse | process metrics + ML/rules | implemented |
-| Sensitive-file access | rule/feature signal | implemented |
-| Execution from suspicious paths | rule signal | implemented |
-| Reverse-shell-like behavior | network/behavior rule | prototype |
-| Large outbound exfiltration | planned eBPF telemetry | not implemented |
+The network demo opens a loopback TCP connection to a flagged port; it does **not** create a shell. Run demos only on systems you own or are authorized to test.
 
 ## Development
-
-Install dependencies and run the tests:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
+python -m compileall -q src shared
+ruff check src shared
 pytest -q
 ```
 
-The CI workflow performs a syntax check and runs the test suite on supported Python versions.
+Pytest is deliberately scoped to `src/`. Manual workload generators under `scripts/` are not tests.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for project conventions.
 
 ## Repository layout
 
 ```text
-shared/                 shared schemas and service contracts
-src/sensor/             process collection and event export
-src/ml/                 data generation, training, and inference
-src/enforcer/           cgroup/process enforcement
-src/integration/        API orchestration and Streamlit UI
-tests/                  integration/demo test workloads
-scripts/                local setup and launcher scripts
+shared/                  shared contracts and control-auth helpers
+src/sensor/              /proc collection, detection, event export
+src/ml/                  synthetic data, training, inference API
+src/enforcer/            process/cgroup control plane
+src/integration/         orchestration API and Streamlit UI
+scripts/                 setup, launcher, manual demo scenarios
+docs/                    architecture and design notes
+.github/                  CI and dependency-update configuration
 ```
 
-## Security
+Generated datasets, model artifacts, virtual environments, local secrets, private keys, logs, and coverage output are excluded from version control.
 
-The Enforcer can modify cgroups and terminate processes, so its API is intentionally treated as a privileged local control plane. See [`SECURITY.md`](SECURITY.md) before changing bind addresses or deploying the project outside an isolated lab.
+## Security and responsible use
 
-If you discover a security issue in the repository itself, please avoid publishing exploit details in a public issue.
+The Enforcer can change resource limits and terminate processes. Keep the project on an isolated development machine or lab VM, leave the default loopback bindings in place, and review [`SECURITY.md`](SECURITY.md) before changing the deployment model.
+
+If you find a vulnerability in the project itself, do not publish exploit details in a public issue before the problem can be assessed.
 
 ## References
 

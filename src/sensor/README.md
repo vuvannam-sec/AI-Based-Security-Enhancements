@@ -1,34 +1,13 @@
-# Sensor Service
+# Sensor service
 
-Thu thập sự kiện từ tiến trình, lưu trong memory, xuất CSV, và chạy phát hiện theo thời gian thực với ML + rule-based.
+The Sensor collects process observations from Linux `/proc`, normalizes them into the shared event schema, maintains a bounded recent-event buffer, and optionally runs the detection/enforcement pipeline.
 
-## Phương thức thu thập
+## Collection
 
-/proc polling: Đọc trực tiếp từ /proc filesystem
-- File: src/sensor/loader/collector.py
-- Đọc: /proc/[pid]/stat, /proc/[pid]/status, /proc/[pid]/statm, /proc/[pid]/io, /proc/[pid]/fd
+The current implementation supports `/proc` polling only. It reads process CPU/memory information, I/O counters, open file descriptors, and TCP socket metadata where available. eBPF collection is a planned extension and is rejected by the current API rather than exposed as a partially working mode.
 
-## Chạy service
+## Endpoints
 
-    cd ~/AI-Based-Security-Enhancements
-    ./scripts/run_all.sh
+Read-only endpoints such as `/sensor/status`, `/sensor/events/latest`, `/sensor/stats`, and enforcement history are available locally without a token. State-changing endpoints (`start`, `stop`, whitelist changes, and auto-detect configuration) require `AISEC_CONTROL_TOKEN`.
 
-## Các endpoint chính
-
-- GET /sensor/status - Trạng thái sensor
-- POST /sensor/start - Bắt đầu thu thập
-- POST /sensor/stop - Dừng thu thập
-- GET /sensor/events/latest?limit=100 - Lấy events mới nhất
-- POST /sensor/auto_detect - Bật/tắt auto-detect
-- GET /sensor/enforcement_history?limit=50 - Lịch sử threats
-
-## Liên quan OS
-
-- Đọc /proc filesystem: tương tác trực tiếp với kernel qua procfs
-- CPU time từ /proc/[pid]/stat
-- Memory từ /proc/[pid]/statm
-- Network từ /proc/net/tcp và /proc/[pid]/fd
-
-## Người phụ trách
-
-Vũ Văn Nam
+When automatic enforcement is enabled, the Sensor forwards the same control token to the Enforcer. Detection uses a bounded worker pool, per-PID in-flight protection, cooldowns, and explicit protected-process checks before an action is submitted.

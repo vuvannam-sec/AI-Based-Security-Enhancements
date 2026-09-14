@@ -1,66 +1,23 @@
-# Enforcer Service
+# Enforcer service
 
-Thực thi các hành động ngăn chặn tiến trình nguy hiểm:
-- kill: Gửi SIGKILL để dừng ngay tiến trình
-- throttle: Giới hạn CPU/memory bằng cgroup v2
+The Enforcer is the project's privileged process-control component. It applies cgroup resource limits or terminates one validated PID.
 
-## Chạy service (cần sudo)
+## Endpoints
 
-    cd ~/AI-Based-Security-Enhancements
-    ./scripts/run_enforcer.sh
+- `GET /enforcer/status` — engine and controller status; read-only.
+- `POST /enforcer/action` — `throttle` or `kill`; requires the control token.
+- `POST /enforcer/release` — remove active resource limits for a managed PID; requires the control token.
 
-Hoặc:
-    sudo -E bash -c 'source .venv/bin/activate && uvicorn src.enforcer.enforcer_service:app --host 0.0.0.0 --port 8002 --reload'
+Mutating requests must include `Authorization: Bearer <AISEC_CONTROL_TOKEN>`.
 
-## Các endpoint
+## Safety checks
 
-GET /enforcer/status
-    Trả về engine (cgroupv2/cgroupv1), controllers available
+The API contract requires a PID greater than 2, validates `cpu.max`-style values and positive memory limits, and the service refuses to target its own PID or parent PID. These are guardrails for local lab use, not permission to expose the service publicly.
 
-POST /enforcer/action
-    Kill: {"pid":1234,"action":"kill"}
-    Throttle: {"pid":1234,"action":"throttle","cpu_max":"20000 100000","memory_max":268435456}
+The launcher binds the service to `127.0.0.1:8002` and starts it with elevated privileges. See the root `SECURITY.md` before changing that boundary.
 
-POST /enforcer/release
-    {"pid":1234}
-    Giải phóng process khỏi cgroup throttle
+## cgroup behavior
 
-## Cgroup v2 implementation
+For cgroup v2, managed processes are placed under `/sys/fs/cgroup/ai-sec/<pid>/`. CPU and memory limits are written through `cpu.max` and `memory.max`. Releasing a process resets those limits without moving a live process into an internal parent cgroup, which avoids cgroup-v2 delegation differences across systemd/VM environments.
 
-File: src/enforcer/cgroups/cgroup_manager.py
-
-1. Tạo cgroup tại /sys/fs/cgroup/ai-sec/[pid]/
-2. Enable controllers: cpu, memory
-3. Move process: echo [pid] > cgroup.procs
-4. Set limits:
-   - cpu.max: "quota period" (e.g., "5000 100000" = 5% CPU)
-   - memory.max: bytes (e.g., 134217728 = 128MB)
-
-## Throttle presets
-
-CPU:
-- 5% CPU: "5000 100000"
-- 10% CPU: "10000 100000"
-- 20% CPU: "20000 100000"
-
-Memory:
-- 128 MB: 134217728
-- 256 MB: 268435456
-- 512 MB: 536870912
-
-## Liên quan OS
-
-- Cgroup v2: Control Groups là cơ chế kernel Linux để quản lý và giới hạn tài nguyên
-- Ghi trực tiếp vào /sys/fs/cgroup/ - sysfs interface của kernel
-- Kill signal: Sử dụng os.kill(pid, signal.SIGKILL) - system call tới kernel
-- Cần quyền root để modify cgroup hierarchy
-
-## Fallback cgroup v1
-
-Nếu cgroup v2 không có controllers, fallback sang v1:
-- /sys/fs/cgroup/cpu/ai-sec/[pid]/cpu.cfs_quota_us
-- /sys/fs/cgroup/memory/ai-sec/[pid]/memory.limit_in_bytes
-
-## Người phụ trách
-
-Nguyễn Công Sơn
+A limited cgroup v1 fallback is retained for older lab environments.

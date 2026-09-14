@@ -1,212 +1,188 @@
+from __future__ import annotations
+
+import os
+import time
+from typing import Any, Dict, List, Optional
+
 import requests
 import streamlit as st
-from typing import Dict, List, Any, Optional
-import time
-import hashlib
+
 
 class APIClient:
-    def __init__(self, sensor_url: str, enforcer_url: str, ml_url: str = None, orch_api_url: str = None):
-        self.sensor_url = sensor_url.rstrip('/')
-        self.enforcer_url = enforcer_url.rstrip('/')
-        self.ml_url = ml_url.rstrip('/') if ml_url else None
-        self.orch_api_url = orch_api_url.rstrip('/') if orch_api_url else None
-        
-    def _get_cache_key(self, method: str, url: str) -> str:
-        """Generate cache key for API requests"""
-        return hashlib.md5(f"{method}:{url}".encode()).hexdigest()
-    
-    def _make_request(self, method: str, url: str, **kwargs) -> Optional[Dict]:
-        """Make HTTP request with error handling"""
+    def __init__(self, sensor_url: str, enforcer_url: str, ml_url: str | None = None, orch_api_url: str | None = None):
+        self.sensor_url = sensor_url.rstrip("/")
+        self.enforcer_url = enforcer_url.rstrip("/")
+        self.ml_url = ml_url.rstrip("/") if ml_url else None
+        self.orch_api_url = orch_api_url.rstrip("/") if orch_api_url else None
+        self.control_token = os.getenv("AISEC_CONTROL_TOKEN", "").strip()
+
+    def _make_request(self, method: str, url: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        headers = dict(kwargs.pop("headers", {}) or {})
+        if self.control_token and "Authorization" not in headers:
+            headers["Authorization"] = f"Bearer {self.control_token}"
         try:
-            response = requests.request(method, url, timeout=5, **kwargs)
+            response = requests.request(method, url, timeout=5, headers=headers, **kwargs)
             response.raise_for_status()
             return response.json()
         except requests.exceptions.ConnectionError:
-            st.error(f"❌ Cannot connect to {url}")
-            return None
+            st.error(f"Cannot connect to {url}")
         except requests.exceptions.Timeout:
-            st.error(f"⏱️ Request timeout to {url}")
-            return None
-        except requests.exceptions.HTTPError as e:
-            st.error(f"❌ HTTP error {e.response.status_code}: {e.response.text}")
-            return None
-        except Exception as e:
-            st.error(f"❌ Unexpected error: {str(e)}")
-            return None
-    
-    # Cached API methods
+            st.error(f"Request timed out: {url}")
+        except requests.exceptions.HTTPError as exc:
+            detail = exc.response.text[:300] if exc.response is not None else str(exc)
+            st.error(f"HTTP request failed: {detail}")
+        except (ValueError, requests.RequestException) as exc:
+            st.error(f"Request failed: {exc}")
+        return None
+
     @st.cache_data(ttl=3, show_spinner=False)
-    def get_sensor_status_cached(_self) -> Optional[Dict]:
-        """Get sensor service status (cached)"""
+    def get_sensor_status_cached(_self) -> Optional[Dict[str, Any]]:
         return _self._make_request("GET", f"{_self.sensor_url}/sensor/status")
-    
+
     @st.cache_data(ttl=2, show_spinner=False)
-    def get_latest_events_cached(_self, limit: int = 100) -> Optional[List[Dict]]:
-        """Get latest events from sensor (cached)"""
+    def get_latest_events_cached(_self, limit: int = 100) -> List[Dict[str, Any]]:
         result = _self._make_request("GET", f"{_self.sensor_url}/sensor/events/latest?limit={limit}")
-        return result.get('events', []) if result else []
-    
+        return result.get("events", []) if result else []
+
     @st.cache_data(ttl=5, show_spinner=False)
-    def get_enforcer_status_cached(_self) -> Optional[Dict]:
-        """Get enforcer service status (cached)"""
+    def get_enforcer_status_cached(_self) -> Optional[Dict[str, Any]]:
         return _self._make_request("GET", f"{_self.enforcer_url}/enforcer/status")
-    
-    # Non-cached API methods (for actions)
-    def get_sensor_status(self) -> Optional[Dict]:
-        """Get sensor service status"""
+
+    def get_sensor_status(self) -> Optional[Dict[str, Any]]:
         return self._make_request("GET", f"{self.sensor_url}/sensor/status")
-    
+
     def start_sensor(
-        self, 
-        mode: str = "proc", 
+        self,
+        mode: str = "proc",
         sample_interval: float = 1.0,
         auto_detect: bool = False,
-        auto_action: str = "throttle"
-    ) -> Optional[Dict]:
-        """Start sensor data collection with optional auto-detect"""
-        data = {
-            "mode": mode, 
-            "sample_interval": sample_interval,
-            "auto_detect": auto_detect,
-            "auto_action": auto_action
-        }
-        # Clear cache after action
+        auto_action: str = "throttle",
+    ) -> Optional[Dict[str, Any]]:
         self.get_sensor_status_cached.clear()
-        return self._make_request("POST", f"{self.sensor_url}/sensor/start", json=data)
-    
-    def stop_sensor(self) -> Optional[Dict]:
-        """Stop sensor data collection"""
-        # Clear cache after action
+        return self._make_request(
+            "POST",
+            f"{self.sensor_url}/sensor/start",
+            json={
+                "mode": mode,
+                "sample_interval": sample_interval,
+                "auto_detect": auto_detect,
+                "auto_action": auto_action,
+            },
+        )
+
+    def stop_sensor(self) -> Optional[Dict[str, Any]]:
         self.get_sensor_status_cached.clear()
         return self._make_request("POST", f"{self.sensor_url}/sensor/stop")
-    
-    def get_latest_events(self, limit: int = 100) -> Optional[List[Dict]]:
-        """Get latest events from sensor"""
+
+    def get_latest_events(self, limit: int = 100) -> List[Dict[str, Any]]:
         result = self._make_request("GET", f"{self.sensor_url}/sensor/events/latest?limit={limit}")
-        return result.get('events', []) if result else []
-    
-    # Enforcer API methods
-    def get_enforcer_status(self) -> Optional[Dict]:
-        """Get enforcer service status"""
+        return result.get("events", []) if result else []
+
+    def get_enforcer_status(self) -> Optional[Dict[str, Any]]:
         return self._make_request("GET", f"{self.enforcer_url}/enforcer/status")
-    
-    def enforce_action(self, pid: int, action: str, cpu_max: str = None, memory_max: int = None) -> Optional[Dict]:
-        """Execute enforcement action (throttle/kill)"""
-        data = {"pid": pid, "action": action}
+
+    def enforce_action(
+        self,
+        pid: int,
+        action: str,
+        cpu_max: str | None = None,
+        memory_max: int | None = None,
+    ) -> Optional[Dict[str, Any]]:
+        data: Dict[str, Any] = {"pid": pid, "action": action}
         if cpu_max:
             data["cpu_max"] = cpu_max
-        if memory_max:
+        if memory_max is not None:
             data["memory_max"] = memory_max
-        # Clear cache after action
         self.get_enforcer_status_cached.clear()
         return self._make_request("POST", f"{self.enforcer_url}/enforcer/action", json=data)
-    
-    def release_process(self, pid: int) -> Optional[Dict]:
-        """Release process from enforcement"""
-        data = {"pid": pid}
-        # Clear cache after action
+
+    def release_process(self, pid: int) -> Optional[Dict[str, Any]]:
         self.get_enforcer_status_cached.clear()
-        return self._make_request("POST", f"{self.enforcer_url}/enforcer/release", json=data)
-    
-    def set_auto_detect(self, enabled: bool, action: str = "throttle") -> Optional[Dict]:
-        """Toggle auto-detect at runtime"""
-        data = {"enabled": enabled, "action": action}
-        # Clear cache after action
+        return self._make_request("POST", f"{self.enforcer_url}/enforcer/release", json={"pid": pid})
+
+    def set_auto_detect(self, enabled: bool, action: str = "throttle") -> Optional[Dict[str, Any]]:
         self.get_sensor_status_cached.clear()
-        return self._make_request("POST", f"{self.sensor_url}/sensor/auto_detect", json=data)
-    
-    def get_enforcement_history(self, limit: int = 50) -> Optional[Dict]:
-        """Get history of detected threats and enforcement actions"""
+        return self._make_request(
+            "POST",
+            f"{self.sensor_url}/sensor/auto_detect",
+            json={"enabled": enabled, "action": action},
+        )
+
+    def get_enforcement_history(self, limit: int = 50) -> Optional[Dict[str, Any]]:
         return self._make_request("GET", f"{self.sensor_url}/sensor/enforcement_history?limit={limit}")
 
+
 def detect_suspicious_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Detect suspicious events based on patterns"""
-    suspicious = []
-    
+    suspicious: List[Dict[str, Any]] = []
     for event in events:
-        reasons = []
-        
-        # Check for privilege escalation syscalls
-        if event.get('syscall_name') in ['setuid', 'setgid', 'setresuid', 'setresgid']:
-            reasons.append("Privilege escalation syscall")
-        
-        # Check for process creation
-        if event.get('syscall_name') in ['execve', 'clone', 'fork']:
+        reasons: List[str] = []
+        if event.get("syscall_name") in {"setuid", "setgid", "setresuid", "setresgid"}:
+            reasons.append("Privilege-related syscall")
+        if event.get("syscall_name") in {"execve", "clone", "fork"}:
             reasons.append("Process creation")
-        
-        # Check for high resource usage
         try:
-            cpu = float(event.get('cpu_percent', 0) or 0)
+            cpu = float(event.get("cpu_percent", 0) or 0)
             if cpu > 80:
                 reasons.append(f"High CPU usage: {cpu}%")
         except (ValueError, TypeError):
             pass
-        
         try:
-            memory = int(event.get('memory_bytes', 0) or 0)
-            if memory > 1024 * 1024 * 1024:  # > 1GB
+            memory = int(event.get("memory_bytes", 0) or 0)
+            if memory > 1024**3:
                 reasons.append(f"High memory usage: {memory / (1024**3):.1f}GB")
         except (ValueError, TypeError):
             pass
-        
-        # Check for suspicious file operations
-        if event.get('file_path') and any(path in event['file_path'] for path in ['/etc/passwd', '/etc/shadow', '/root']):
+        file_path = str(event.get("file_path") or "")
+        if any(path in file_path for path in ("/etc/passwd", "/etc/shadow", "/root/.ssh")):
             reasons.append("Sensitive file access")
-        
         if reasons:
             alert = event.copy()
-            alert['alert_reasons'] = reasons
-            alert['severity'] = 'HIGH' if len(reasons) > 1 else 'MEDIUM'
+            alert["alert_reasons"] = reasons
+            alert["severity"] = "HIGH" if len(reasons) > 1 else "MEDIUM"
             suspicious.append(alert)
-    
     return suspicious
 
+
 def format_memory_size(bytes_value: Any) -> str:
-    """Format memory size in human readable format"""
     try:
-        bytes_val = int(bytes_value or 0)
-        if bytes_val == 0:
+        value = float(int(bytes_value or 0))
+        if value == 0:
             return "0 B"
-        
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if bytes_val < 1024:
-                return f"{bytes_val:.1f} {unit}"
-            bytes_val /= 1024
-        return f"{bytes_val:.1f} TB"
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024:
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{value:.1f} TB"
     except (ValueError, TypeError):
         return "N/A"
+
 
 def format_timestamp(timestamp: Any) -> str:
-    """Format timestamp to readable string"""
     try:
-        ts = float(timestamp)
-        return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(timestamp)))
     except (ValueError, TypeError):
         return "N/A"
 
-def init_session_state():
-    """Initialize session state with default values"""
-    if "last_sensor_status" not in st.session_state:
-        st.session_state.last_sensor_status = None
-    if "last_enforcer_status" not in st.session_state:
-        st.session_state.last_enforcer_status = None
-    if "last_events" not in st.session_state:
-        st.session_state.last_events = []
-    if "last_update_time" not in st.session_state:
-        st.session_state.last_update_time = 0
 
-def get_cached_or_fetch(api_client: APIClient, data_type: str, fetch_func, *args, **kwargs):
-    """Get cached data or fetch new data, maintaining previous state"""
+def init_session_state() -> None:
+    defaults = {
+        "last_sensor_status": None,
+        "last_enforcer_status": None,
+        "last_events": [],
+        "last_update_time": 0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def get_cached_or_fetch(api_client: APIClient, data_type: str, fetch_func: Any, *args: Any, **kwargs: Any):
     try:
         new_data = fetch_func(*args, **kwargs)
         if new_data is not None:
-            # Update session state with new data
             st.session_state[f"last_{data_type}"] = new_data
             st.session_state.last_update_time = time.time()
-            return new_data, True  # (data, is_fresh)
-        else:
-            # Return cached data if fetch failed
-            return st.session_state.get(f"last_{data_type}"), False
+            return new_data, True
     except Exception:
-        # Return cached data on any error
-        return st.session_state.get(f"last_{data_type}"), False
+        pass
+    return st.session_state.get(f"last_{data_type}"), False

@@ -24,6 +24,12 @@ fi
 
 source .venv/bin/activate
 
+if [ -z "${AISEC_CONTROL_TOKEN:-}" ]; then
+    AISEC_CONTROL_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    export AISEC_CONTROL_TOKEN
+    echo "Generated an ephemeral control token for this run."
+fi
+
 port_in_use() {
     local port="$1"
     if command -v ss >/dev/null 2>&1; then
@@ -52,17 +58,21 @@ start_service() {
 
 start_service "Sensor (8001)" \
     .venv/bin/uvicorn src.sensor.sensor_service:app --host "$HOST" --port 8001
-
 start_service "Enforcer (8002, privileged)" \
     sudo -E .venv/bin/uvicorn src.enforcer.enforcer_service:app --host "$HOST" --port 8002
-
 start_service "ML service (8003)" \
     .venv/bin/uvicorn src.ml.ml_service:app --host "$HOST" --port 8003
-
 start_service "Orchestrator (8000)" \
     .venv/bin/uvicorn src.integration.api.main:app --host "$HOST" --port 8000
 
 sleep 3
+
+for pid in "${PIDS[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "A service exited during startup. Check the logs above."
+        exit 1
+    fi
+done
 
 check_service() {
     local name="$1"
@@ -84,7 +94,10 @@ check_service "Orchestrator" "http://127.0.0.1:8000/status"
 
 echo
 echo "Dashboard: http://127.0.0.1:8501"
-echo "APIs are bound to $HOST by default. Do not expose the privileged Enforcer API to untrusted networks."
+echo "Control endpoints require a bearer token and services bind to loopback by default."
+if [ "$HOST" != "127.0.0.1" ] && [ "$HOST" != "localhost" ]; then
+    echo "WARNING: API services are bound to $HOST. Use only on an isolated, trusted network."
+fi
 echo "Press Ctrl+C to stop all services."
 echo
 

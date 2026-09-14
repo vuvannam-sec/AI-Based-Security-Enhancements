@@ -1,129 +1,105 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+from shared.security import control_headers, require_control_token
 
 
 def _env_url(name: str, default: str) -> str:
     return os.getenv(name, default).rstrip("/")
 
 
-SENSOR_URL = _env_url("SENSOR_URL", "http://localhost:8001")
-ENFORCER_URL = _env_url("ENFORCER_URL", "http://localhost:8002")
-ML_URL = _env_url("ML_URL", "http://localhost:8003")
+SENSOR_URL = _env_url("SENSOR_URL", "http://127.0.0.1:8001")
+ENFORCER_URL = _env_url("ENFORCER_URL", "http://127.0.0.1:8002")
+ML_URL = _env_url("ML_URL", "http://127.0.0.1:8003")
 
-
-app = FastAPI(title="Integration Orchestrator", version="0.1")
+app = FastAPI(title="Integration Orchestrator", version="0.2")
 
 
 class PipelineProcessRequest(BaseModel):
-    """
-    Nhận 1 event theo schema chung (dict). Orchestrator sẽ:
-    - gọi ML /ml/predict
-    - nếu malicious -> gọi Enforcer /enforcer/action
-    """
-
-    event: Dict[str, Any] = Field(..., description="Event object (28-column schema as dict)")
+    event: Dict[str, Any] = Field(..., description="Event object using the shared event schema")
     enforce_if_malicious: bool = True
-    enforcer_action: str = Field("throttle", description="throttle|kill")
-    cpu_max: Optional[str] = Field("20000 100000", description='cgroup cpu.max e.g. "20000 100000"')
-    memory_max: Optional[int] = Field(268435456, description="memory limit bytes, e.g. 268435456 = 256MB")
+    enforcer_action: Literal["throttle", "kill"] = "throttle"
+    cpu_max: str | None = "20000 100000"
+    memory_max: int | None = Field(default=268_435_456, gt=0)
 
 
 class PipelineProcessResponse(BaseModel):
     ok: bool
     ml_result: Dict[str, Any]
-    enforcer_result: Optional[Dict[str, Any]] = None
+    enforcer_result: Dict[str, Any] | None = None
 
 
 async def _get_json(client: httpx.AsyncClient, url: str) -> Dict[str, Any]:
-    r = await client.get(url, timeout=5)
-    r.raise_for_status()
-    return r.json()
+    response = await client.get(url, timeout=5)
+    response.raise_for_status()
+    return response.json()
 
 
-async def _post_json(client: httpx.AsyncClient, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    r = await client.post(url, json=payload, timeout=10)
-    r.raise_for_status()
-    return r.json()
+async def _post_json(
+    client: httpx.AsyncClient,
+    url: str,
+    payload: Dict[str, Any],
+    *,
+    headers: Dict[str, str] | None = None,
+) -> Dict[str, Any]:
+    response = await client.post(url, json=payload, headers=headers, timeout=10)
+    response.raise_for_status()
+    return response.json()
 
 
 @app.get("/status")
 async def status() -> Dict[str, Any]:
-    """
-    Health check + kiểm tra nhanh khả năng gọi 3 services.
-    """
     async with httpx.AsyncClient() as client:
-        sensor_ok = ml_ok = enforcer_ok = False
-        sensor_err = ml_err = enforcer_err = None
+        services: Dict[str, Dict[str, Any]] = {}
+        for name, url in (
+            ("sensor", f"{SENSOR_URL}/sensor/status"),
+            ("ml", f"{ML_URL}/ml/status"),
+            ("enforcer", f"{ENFORCER_URL}/enforcer/status"),
+        ):
+            try:
+                await _get_json(client, url)
+                services[name] = {"url": url.rsplit("/", 1)[0], "ok": True, "error": None}
+            except Exception as exc:  # health endpoint must report partial failures
+                services[name] = {"url": url.rsplit("/", 1)[0], "ok": False, "error": str(exc)}
 
-        try:
-            await _get_json(client, f"{SENSOR_URL}/sensor/status")
-            sensor_ok = True
-        except Exception as e:  # noqa: BLE001
-            sensor_err = str(e)
-
-        try:
-            await _get_json(client, f"{ML_URL}/ml/status")
-            ml_ok = True
-        except Exception as e:  # noqa: BLE001
-            ml_err = str(e)
-
-        try:
-            await _get_json(client, f"{ENFORCER_URL}/enforcer/status")
-            enforcer_ok = True
-        except Exception as e:  # noqa: BLE001
-            enforcer_err = str(e)
-
-    return {
-        "ok": True,
-        "services": {
-            "sensor": {"url": SENSOR_URL, "ok": sensor_ok, "error": sensor_err},
-            "ml": {"url": ML_URL, "ok": ml_ok, "error": ml_err},
-            "enforcer": {"url": ENFORCER_URL, "ok": enforcer_ok, "error": enforcer_err},
-        },
-    }
+    return {"ok": True, "services": services}
 
 
-@app.post("/pipeline/process", response_model=PipelineProcessResponse)
+@app.post(
+    "/pipeline/process",
+    response_model=PipelineProcessResponse,
+    dependencies=[Depends(require_control_token)],
+)
 async def pipeline_process(req: PipelineProcessRequest) -> PipelineProcessResponse:
-    """
-    Pipeline: Event -> Predict -> (Action).
-    - Nếu ML trả label==1 hoặc action=="block" => coi là malicious.
-    """
-    if req.enforcer_action not in ("throttle", "kill"):
-        raise HTTPException(status_code=400, detail="enforcer_action must be 'throttle' or 'kill'")
-
     pid = req.event.get("pid")
-    if pid is None:
-        raise HTTPException(status_code=400, detail="event.pid is required")
     try:
         pid_int = int(pid)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"event.pid must be int-like: {e}")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="event.pid must be an integer") from exc
+    if pid_int <= 2:
+        raise HTTPException(status_code=400, detail="event.pid must be greater than 2")
 
     async with httpx.AsyncClient() as client:
-        # 1) predict
         try:
             ml_result = await _post_json(client, f"{ML_URL}/ml/predict", {"event": req.event})
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=f"ML error: {e.response.text}")
-        except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=f"Cannot reach ML: {e}")
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="ML service unavailable") from exc
 
         if not ml_result.get("ok"):
-            return PipelineProcessResponse(ok=False, ml_result=ml_result, enforcer_result=None)
+            return PipelineProcessResponse(ok=False, ml_result=ml_result)
 
-        label = ml_result.get("label")
-        action = str(ml_result.get("action") or "")
-        is_malicious = (label == 1) or (action.lower() == "block")
+        is_malicious = (
+            ml_result.get("label") == 1
+            or str(ml_result.get("action") or "").lower() == "block"
+        )
 
-        # 2) enforce
-        enforcer_result: Optional[Dict[str, Any]] = None
+        enforcer_result: Dict[str, Any] | None = None
         if req.enforce_if_malicious and is_malicious:
             payload: Dict[str, Any] = {"pid": pid_int, "action": req.enforcer_action}
             if req.enforcer_action == "throttle":
@@ -133,12 +109,17 @@ async def pipeline_process(req: PipelineProcessRequest) -> PipelineProcessRespon
                     payload["memory_max"] = req.memory_max
 
             try:
-                enforcer_result = await _post_json(client, f"{ENFORCER_URL}/enforcer/action", payload)
-            except httpx.HTTPStatusError as e:
-                raise HTTPException(status_code=502, detail=f"Enforcer error: {e.response.text}")
-            except Exception as e:  # noqa: BLE001
-                raise HTTPException(status_code=502, detail=f"Cannot reach Enforcer: {e}")
+                enforcer_result = await _post_json(
+                    client,
+                    f"{ENFORCER_URL}/enforcer/action",
+                    payload,
+                    headers=control_headers(),
+                )
+            except httpx.HTTPError as exc:
+                raise HTTPException(status_code=502, detail="Enforcer service unavailable") from exc
 
-        return PipelineProcessResponse(ok=True, ml_result=ml_result, enforcer_result=enforcer_result)
-
-
+        return PipelineProcessResponse(
+            ok=True,
+            ml_result=ml_result,
+            enforcer_result=enforcer_result,
+        )
