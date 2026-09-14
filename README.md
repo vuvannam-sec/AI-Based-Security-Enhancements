@@ -1,109 +1,174 @@
-# AI-Based Security Enhancements (OS Project)
+# AI-Based Security Enhancements
 
-Hệ thống phát hiện và ngăn chặn xâm nhập theo thời gian thực trên Linux.
+A Linux host-monitoring prototype that combines `/proc` telemetry, lightweight machine-learning classification, rule-based detection, and cgroup-based response.
 
-## Tổng quan
+The project is intended for local research, lab exercises, and defensive experimentation. It is **not** a production EDR, antivirus, or host intrusion-prevention product.
 
-Hệ thống giám sát các tiến trình đang chạy, sử dụng model ML để phát hiện hành vi đáng ngờ, và thực thi phản hồi theo thời gian thực.
+## What it does
 
-Gồm 5 thành phần chính:
+The runtime is split into small services:
 
-- Sensor: Thu thập sự kiện từ tiến trình qua /proc filesystem
-- ML Service: Dự đoán hành vi bình thường hay tấn công (RandomForest)
-- Enforcer: Giới hạn/dừng tiến trình nguy hiểm bằng cgroup v2
-- Orchestrator: API tích hợp pipeline detect-and-respond
-- Streamlit UI: Dashboard và cảnh báo thời gian thực
+- **Sensor** — polls Linux process state from `/proc`, enriches process events, and keeps a recent in-memory event buffer.
+- **ML service** — trains and serves a scikit-learn classifier using the shared event schema.
+- **Enforcer** — throttles processes with cgroups or terminates a selected PID.
+- **Orchestrator** — sends events through prediction and, when enabled, forwards malicious decisions to the enforcer.
+- **Dashboard** — provides a Streamlit view for service state, detections, and demo controls.
 
-Môi trường: Ubuntu VM (VirtualBox), Python 3.10+
+```text
+/proc
+  |
+  v
+Sensor -----> ML service
+  |              |
+  |              v
+  +--------> detection decision
+                  |
+                  v
+              Enforcer
+                  |
+                  v
+             cgroup / signal
 
-## Yêu cầu hệ thống
+Dashboard <----> services
+Orchestrator ---> ML ---> Enforcer
+```
 
-- Ubuntu 22.04+ (VM hoặc native)
+## Current scope
+
+| Capability | Status | Notes |
+| --- | --- | --- |
+| Process telemetry | Implemented | `/proc` polling; Linux only |
+| CPU / memory heuristics | Implemented | Rule-based fallback in the sensor |
+| Sensitive-file heuristic | Implemented | Based on observable open files and configured paths |
+| Suspicious execution heuristic | Implemented | Includes temporary execution paths |
+| Suspicious-port heuristic | Implemented | Intended for lab/demo detection, not full network inspection |
+| ML classification | Implemented | scikit-learn pipeline trained from generated data |
+| Process throttling | Implemented | cgroup v2 with a cgroup v1 fallback |
+| Process termination | Implemented | Sends `SIGKILL` to an explicitly selected PID |
+| eBPF telemetry | Planned | Not part of the current collector |
+| Production-grade exfiltration detection | Not implemented | Requires stronger network/event telemetry |
+
+## Security boundary
+
+The enforcer is the most sensitive component: it can run with elevated privileges and can terminate or throttle processes. `scripts/run_all.sh` therefore binds services to `127.0.0.1` by default.
+
+Do not expose the enforcer or the combined service stack directly to an untrusted network. The project currently does not provide production authentication, authorization, tenant isolation, or transport security.
+
+If you deliberately change the bind address, place the services behind an appropriate security boundary and understand the impact of exposing privileged control endpoints.
+
+See [SECURITY.md](SECURITY.md) for reporting and operational guidance.
+
+## Requirements
+
+- Linux with `/proc`
+- Ubuntu 22.04+ recommended
 - Python 3.10+
-- Quyền sudo (cho Enforcer)
+- cgroup v2 preferred
+- `sudo` for enforcement operations
 
-## Cài đặt và huấn luyện (chạy 1 lần)
+VirtualBox/VM environments are suitable for demonstrations. cgroup behavior can differ under containers, WSL, and restricted VMs.
 
-cd ~/AI-Based-Security-Enhancements
+## Quick start
+
+```bash
+git clone https://github.com/vuvannam-sec/AI-Based-Security-Enhancements.git
+cd AI-Based-Security-Enhancements
 chmod +x scripts/*.sh
 ./scripts/setup_and_train.sh
-
-Lệnh này sẽ tạo ra:
-
-- data/synthetic/synthetic_events.csv - dữ liệu huấn luyện
-- data/models/classifier_pipeline.joblib - model đã train
-
-## Chạy hệ thống
-
-cd ~/AI-Based-Security-Enhancements
 ./scripts/run_all.sh
+```
 
-Truy cập:
+The setup script creates a virtual environment, installs dependencies, generates synthetic training data, and trains the initial model.
 
-- UI Dashboard: http://localhost:8501
-- Sensor API: http://localhost:8001/sensor/status
-- Enforcer API: http://localhost:8002/enforcer/status
-- ML API: http://localhost:8003/ml/status
-- Orchestrator: http://localhost:8000/status
+Generated artifacts are kept under `data/` and are intentionally ignored by Git.
 
-## Demo (giả lập tấn công)
+### Local endpoints
 
-1. Mở UI tại http://localhost:8501
-2. Vào Settings, đảm bảo:
-   - Sensor đang chạy (mode: proc)
-   - Auto-Detect: ON
-   - Action: throttle hoặc kill
+When started with the default configuration:
 
-3. Chạy test trong terminal khác:
+| Service | Endpoint |
+| --- | --- |
+| Dashboard | `http://127.0.0.1:8501` |
+| Orchestrator | `http://127.0.0.1:8000/status` |
+| Sensor | `http://127.0.0.1:8001/sensor/status` |
+| Enforcer | `http://127.0.0.1:8002/enforcer/status` |
+| ML service | `http://127.0.0.1:8003/ml/status` |
 
-Test CPU abuse (crypto miner simulation):
-python3 tests/test_scripts/test_attacks.py cpu_abuse 30
+## Safe demo workflow
 
-Test sensitive file access:
-python3 tests/test_scripts/test_attacks.py sensitive_file
+Start the stack, enable auto-detection from the dashboard, and run one simulator explicitly from a second terminal:
 
-Test suspicious execution:
-python3 tests/test_scripts/test_attacks.py suspicious_exec
+```bash
+python3 tools/attack_simulator.py cpu_abuse 20
+python3 tools/attack_simulator.py sensitive_file 10
+python3 tools/attack_simulator.py suspicious_exec 10
+python3 tools/attack_simulator.py reverse_shell 10
+```
 
-Test reverse shell:
-python3 tests/test_scripts/test_attacks.py reverse_shell 30
+These are **local lab simulations**, not exploit tooling. They intentionally create observable behaviors such as CPU load, access to standard Linux security files, execution from `/tmp`, or a localhost connection to a suspicious demo port.
 
-Chạy tất cả tests:
-python3 tests/test_scripts/test_attacks.py all
+Review recent enforcement decisions with:
 
-4. Quan sát kết quả trên UI Dashboard hoặc:
+```bash
+curl -s 'http://127.0.0.1:8001/sensor/enforcement_history?limit=10' \
+  | python3 -m json.tool
+```
 
-curl -s "http://localhost:8001/sensor/enforcement_history?limit=10" | python3 -m json.tool
+## Development
 
-## Các loại tấn công phát hiện được
+Create an environment and install dependencies:
 
-| Loại tấn công | Mô tả | Detection |
-|---------------|-------|-----------|
-| CPU Abuse (Crypto Miner) | CPU > 80% kéo dài | Rule + ML |
-| Sensitive File Access | Đọc /etc/shadow, /etc/passwd... | Rule + ML |
-| Suspicious Exec | Thực thi từ /tmp/, /dev/shm/ | Rule |
-| Reverse Shell | Kết nối đến port nghi ngờ (4444, 5555...) | Rule |
-| Data Exfiltration | Gửi lượng lớn dữ liệu ra ngoài | Future (eBPF) |
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
-## Lưu ý kỹ thuật
+Run the automated test suite:
 
-- Enforcer cần sudo vì ghi vào /sys/fs/cgroup/
-- Hệ thống tự động whitelist các service để tránh tự block
-- Mode proc polling mỗi 0.5s, detect trong khoảng 10s
-- Mode eBPF (future): real-time, hỗ trợ data exfiltration detection
+```bash
+pytest -q
+```
 
-## Phân công công việc
+The manual attack simulator is kept outside pytest's test paths so a normal test run cannot accidentally launch stress or network demo activity.
 
-| Thành viên | Công việc |
-|------------|-----------|
-| Vũ Văn Nam | Sensor collector (/proc), Schema, CSV exporter |
-| Trần Bình Minh | ML service (train, predict), Feature engineering |
-| Nguyễn Công Sơn | Enforcer (cgroup v2), Scripts, UI, Demo |
+## Repository layout
+
+```text
+shared/                 Shared contracts and event schema
+src/sensor/             /proc collection and detection loop
+src/ml/                 Data generation, training, inference, API
+src/enforcer/           cgroup and process-control service
+src/integration/api/    Orchestrator API
+src/integration/ui/     Streamlit dashboard
+scripts/                Setup and local service launcher
+tools/                  Explicitly invoked lab/demo utilities
+```
+
+## Known limitations
+
+- Training data is synthetic and should not be treated as representative of real enterprise telemetry.
+- `/proc` polling can miss short-lived activity and does not provide syscall-level fidelity.
+- Several detections are deliberately simple heuristics for demonstration and evaluation.
+- The services do not yet implement authentication or encrypted service-to-service transport.
+- Enforcement requires elevated OS privileges and should be used only in an isolated environment you control.
+- The current design is not hardened against a hostile local administrator or kernel-level adversary.
+
+## Direction
+
+Useful next steps are evidence-driven rather than feature-count driven:
+
+1. Replace or complement polling with eBPF event collection.
+2. Add authenticated control-plane calls before supporting remote deployment.
+3. Build a reproducible labeled dataset and measure false-positive/false-negative rates.
+4. Add process identity checks so enforcement decisions remain valid across PID reuse.
+5. Separate policy decisions from enforcement mechanics and add an audit trail.
+6. Add packaging and deployment profiles for lab, container, and VM environments.
 
 ## References
 
-- Linux /proc filesystem: https://man7.org/linux/man-pages/man5/proc.5.html
-- Cgroup v2: https://docs.kernel.org/admin-guide/cgroup-v2.html
-- scikit-learn RandomForest: https://scikit-learn.org/stable/modules/ensemble.html
-- FastAPI: https://fastapi.tiangolo.com/
-- Streamlit: https://streamlit.io/
+- [Linux `/proc` filesystem](https://man7.org/linux/man-pages/man5/proc.5.html)
+- [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+- [scikit-learn Random Forest](https://scikit-learn.org/stable/modules/ensemble.html)
+- [FastAPI](https://fastapi.tiangolo.com/)
+- [Streamlit](https://streamlit.io/)
