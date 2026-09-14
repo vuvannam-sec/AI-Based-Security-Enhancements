@@ -4,7 +4,7 @@ uvicorn[standard]>=0.32.0
 pydantic>=2.10.0
 
 # HTTP client
-httpx>=0.28.0
+httpx>=0.28.1
 
 # ML dependencies
 scikit-learn>=1.5.0
