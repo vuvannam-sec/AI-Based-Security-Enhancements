@@ -1,92 +1,107 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
 cd "$(dirname "$0")/.."
 
-echo "🚀 Starting AI Security Monitor - All Services"
-echo "=============================================="
+HOST="${HOST:-127.0.0.1}"
+UI_HOST="${UI_HOST:-127.0.0.1}"
+PIDS=()
 
-# Check virtual environment
+cleanup() {
+    if ((${#PIDS[@]})); then
+        echo
+        echo "Stopping services..."
+        kill "${PIDS[@]}" 2>/dev/null || true
+        wait "${PIDS[@]}" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
 if [ ! -d ".venv" ]; then
-    echo "❌ Virtual environment not found. Run first:"
-    echo "   ./scripts/setup_and_train.sh"
+    echo "Virtual environment not found. Run ./scripts/setup_and_train.sh first."
     exit 1
 fi
 
 source .venv/bin/activate
 
-# Function to kill process on port (dùng sudo để kill cả root processes)
-kill_port() {
-    local port=$1
-    local pid=$(sudo lsof -ti:$port 2>/dev/null || true)
-    if [ -n "$pid" ]; then
-        echo "   Killing process on port $port (PID: $pid)"
-        sudo kill -9 $pid 2>/dev/null || true
-        sleep 1
-    fi
-}
+if [ -z "${AISEC_CONTROL_TOKEN:-}" ]; then
+    AISEC_CONTROL_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    export AISEC_CONTROL_TOKEN
+    echo "Generated an ephemeral control token for this run."
+fi
 
-echo ""
-echo "🔪 Cleaning up old processes..."
-kill_port 8000
-kill_port 8001
-kill_port 8002
-kill_port 8003
-kill_port 8501
-sleep 2
-
-echo ""
-echo "📡 Starting Sensor on port 8001..."
-.venv/bin/uvicorn src.sensor.sensor_service:app --host 0.0.0.0 --port 8001 &
-sleep 2
-
-echo "🛡️  Starting Enforcer on port 8002 (requires sudo)..."
-sudo -E .venv/bin/uvicorn src.enforcer.enforcer_service:app --host 0.0.0.0 --port 8002 &
-sleep 2
-
-echo "🧠 Starting ML on port 8003..."
-.venv/bin/uvicorn src.ml.ml_service:app --host 0.0.0.0 --port 8003 &
-sleep 2
-
-echo "🎯 Starting Orchestrator on port 8000..."
-.venv/bin/uvicorn src.integration.api.main:app --host 0.0.0.0 --port 8000 &
-sleep 3
-
-echo ""
-echo "🔍 Checking services..."
-
-check_service() {
-    local name=$1
-    local url=$2
-    if curl -s "$url" >/dev/null 2>&1; then
-        echo "   ✅ $name: Ready"
-        return 0
+port_in_use() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn "sport = :$port" 2>/dev/null | grep -q LISTEN
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1
     else
-        echo "   ❌ $name: Not responding"
         return 1
     fi
 }
 
-check_service "Sensor" "http://localhost:8001/sensor/status"
-check_service "Enforcer" "http://localhost:8002/enforcer/status"
-check_service "ML" "http://localhost:8003/ml/status"
-check_service "Orchestrator" "http://localhost:8000/status"
+for port in 8000 8001 8002 8003 8501; do
+    if port_in_use "$port"; then
+        echo "Port $port is already in use. Stop the existing service and retry."
+        exit 1
+    fi
+done
 
-echo ""
-echo "=============================================="
-echo "🎉 All services started!"
-echo ""
-echo "📊 UI Dashboard:    http://localhost:8501"
-echo "📡 Sensor API:      http://localhost:8001"
-echo "🛡️  Enforcer API:    http://localhost:8002"
-echo "🧠 ML API:          http://localhost:8003"
-echo "🎯 Orchestrator:    http://localhost:8000"
-echo ""
-echo "Press Ctrl+C to stop all services"
-echo "=============================================="
-echo ""
+start_service() {
+    local name="$1"
+    shift
+    echo "Starting $name..."
+    "$@" &
+    PIDS+=("$!")
+}
 
-echo "🖥️  Starting UI on port 8501..."
+start_service "Sensor (8001)" \
+    .venv/bin/uvicorn src.sensor.sensor_service:app --host "$HOST" --port 8001
+start_service "Enforcer (8002, privileged)" \
+    sudo -E .venv/bin/uvicorn src.enforcer.enforcer_service:app --host "$HOST" --port 8002
+start_service "ML service (8003)" \
+    .venv/bin/uvicorn src.ml.ml_service:app --host "$HOST" --port 8003
+start_service "Orchestrator (8000)" \
+    .venv/bin/uvicorn src.integration.api.main:app --host "$HOST" --port 8000
+
+sleep 3
+
+for pid in "${PIDS[@]}"; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "A service exited during startup. Check the logs above."
+        exit 1
+    fi
+done
+
+check_service() {
+    local name="$1"
+    local url="$2"
+    if curl --fail --silent --show-error --max-time 3 "$url" >/dev/null; then
+        printf '  %-14s ready\n' "$name"
+    else
+        printf '  %-14s unavailable\n' "$name"
+        return 1
+    fi
+}
+
+echo
+echo "Service check"
+check_service "Sensor" "http://127.0.0.1:8001/sensor/status"
+check_service "Enforcer" "http://127.0.0.1:8002/enforcer/status"
+check_service "ML" "http://127.0.0.1:8003/ml/status"
+check_service "Orchestrator" "http://127.0.0.1:8000/status"
+
+echo
+echo "Dashboard: http://127.0.0.1:8501"
+echo "Control endpoints require a bearer token and services bind to loopback by default."
+if [ "$HOST" != "127.0.0.1" ] && [ "$HOST" != "localhost" ]; then
+    echo "WARNING: API services are bound to $HOST. Use only on an isolated, trusted network."
+fi
+echo "Press Ctrl+C to stop all services."
+echo
+
 .venv/bin/streamlit run src/integration/ui/app.py \
-    --server.address 0.0.0.0 \
+    --server.address "$UI_HOST" \
     --server.port 8501 \
     --server.headless true

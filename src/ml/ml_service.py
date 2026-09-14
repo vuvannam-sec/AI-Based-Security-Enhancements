@@ -1,94 +1,107 @@
-"""
-ML Service for Intrusion Detection System
-==========================================
-Provides REST API for:
-- Model status checking
-- Single event prediction
-- Batch prediction
-- Model retraining
-"""
-
 from __future__ import annotations
 
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any, Dict, List
 
-from typing import Any, Dict, List, Optional
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel, Field
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-
+from shared.security import control_auth_configured, require_control_token
 from src.ml.inference.predictor import Predictor
-from src.ml.training.train_pipeline import train_from_csv, get_feature_columns
+from src.ml.training.train_pipeline import train_from_csv
 
-app = FastAPI(title="ML Intrusion Detection Service", version="1.0")
+logger = logging.getLogger("ml-service")
+app = FastAPI(title="ML Intrusion Detection Service", version="1.1")
 
-predictor: Optional[Predictor] = None
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_data_setting = Path(os.getenv("AISEC_DATA_DIR", "data"))
+DATA_ROOT = (_data_setting if _data_setting.is_absolute() else REPO_ROOT / _data_setting).resolve()
+MODEL_DIR = DATA_ROOT / "models"
+MODEL_PATH = MODEL_DIR / "classifier_pipeline.joblib"
+REPORT_PATH = MODEL_DIR / "train_report.json"
+DEFAULT_SYNTHETIC_PATH = DATA_ROOT / "synthetic" / "synthetic_events.csv"
 
+predictor: Predictor | None = None
 
-# =============================================================================
-# REQUEST/RESPONSE SCHEMAS
-# =============================================================================
 
 class PredictRequest(BaseModel):
     event: Dict[str, Any]
 
 
 class PredictBatchRequest(BaseModel):
-    events: List[Dict[str, Any]]
+    events: List[Dict[str, Any]] = Field(min_length=1, max_length=500)
 
 
 class RetrainRequest(BaseModel):
     csv_path: str = "data/synthetic/synthetic_events.csv"
-    n_normal: int = 3000
-    n_attack: int = 1000
-    regenerate: bool = False  # If True, regenerate synthetic data before training
+    n_normal: int = Field(default=3000, ge=50, le=100_000)
+    n_attack: int = Field(default=1000, ge=50, le=100_000)
+    regenerate: bool = False
 
 
 class GenerateDataRequest(BaseModel):
-    n_normal: int = 3000
-    n_attack: int = 1000
+    n_normal: int = Field(default=3000, ge=50, le=100_000)
+    n_attack: int = Field(default=1000, ge=50, le=100_000)
     output_path: str = "data/synthetic/synthetic_events.csv"
 
 
-# =============================================================================
-# LIFECYCLE
-# =============================================================================
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _resolve_data_path(raw_path: str, *, suffix: str | None = None) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        # Preserve the public API's historical ``data/...`` paths while allowing
+        # AISEC_DATA_DIR to relocate generated artifacts outside the repository.
+        parts = path.parts[1:] if path.parts and path.parts[0] == "data" else path.parts
+        path = DATA_ROOT.joinpath(*parts)
+    path = path.resolve()
+
+    if not path.is_relative_to(DATA_ROOT):
+        raise HTTPException(status_code=400, detail="path must stay inside the configured data directory")
+    if suffix and path.suffix.lower() != suffix.lower():
+        raise HTTPException(status_code=400, detail=f"path must end with {suffix}")
+    return path
+
+
+def _reload_predictor() -> None:
+    global predictor
+    predictor = Predictor(str(MODEL_PATH))
+
 
 @app.on_event("startup")
 def _load_model() -> None:
-    """Load model on startup if exists."""
     global predictor
     try:
-        predictor = Predictor("data/models/classifier_pipeline.joblib")
-        print("[ML Service] Model loaded successfully")
+        _reload_predictor()
+        logger.info("loaded model from %s", _display_path(MODEL_PATH))
     except FileNotFoundError:
-        print("[ML Service] No model found. Please train first via /ml/retrain")
         predictor = None
-    except Exception as e:
-        print(f"[ML Service] Error loading model: {e}")
+        logger.info("no model artifact found; run setup or POST /ml/retrain")
+    except Exception:
         predictor = None
+        logger.exception("failed to load model artifact")
 
-
-# =============================================================================
-# ENDPOINTS
-# =============================================================================
 
 @app.get("/ml/status")
 def status() -> Dict[str, Any]:
-    """Check ML service status and model readiness."""
-    feature_names = []
-    if predictor is not None:
-        feature_names = predictor.feature_names
-    
+    feature_names = predictor.feature_names if predictor is not None else []
     return {
         "ready": predictor is not None,
-        "model_path": "data/models/classifier_pipeline.joblib",
+        "control_auth_configured": control_auth_configured(),
+        "model_path": _display_path(MODEL_PATH),
         "feature_count": len(feature_names),
         "features": feature_names,
         "supported_threats": [
             "sensitive_file_access",
-            "privilege_escalation", 
+            "privilege_escalation",
             "suspicious_exec",
             "crypto_miner",
             "reverse_shell",
@@ -99,32 +112,22 @@ def status() -> Dict[str, Any]:
 
 @app.post("/ml/predict")
 def predict(req: PredictRequest) -> Dict[str, Any]:
-    """
-    Predict on a single event.
-    
-    Returns:
-        - ok: bool
-        - label: 0 (normal) or 1 (attack)
-        - score: probability of attack (0.0 - 1.0)
-        - action: "allow", "monitor", or "block"
-        - threat_type: type of detected threat (if any)
-    """
     if predictor is None:
         return {
-            "ok": False, 
-            "error": "Model not loaded. Train first via POST /ml/retrain",
+            "ok": False,
+            "error": "model is not loaded",
             "label": 0,
             "score": 0.0,
             "action": "allow",
         }
-    
+
     try:
-        result = predictor.predict_one(req.event)
-        return result
-    except Exception as e:
+        return predictor.predict_one(req.event)
+    except Exception as exc:
+        logger.exception("single-event prediction failed")
         return {
             "ok": False,
-            "error": str(e),
+            "error": type(exc).__name__,
             "label": 0,
             "score": 0.0,
             "action": "allow",
@@ -133,96 +136,88 @@ def predict(req: PredictRequest) -> Dict[str, Any]:
 
 @app.post("/ml/predict/batch")
 def predict_batch(req: PredictBatchRequest) -> Dict[str, Any]:
-    """Predict on multiple events."""
     if predictor is None:
-        return {"ok": False, "error": "Model not loaded. Train first via POST /ml/retrain"}
-    
+        return {"ok": False, "error": "model is not loaded"}
     try:
         return predictor.predict_batch(req.events)
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    except Exception as exc:
+        logger.exception("batch prediction failed")
+        return {"ok": False, "error": type(exc).__name__}
 
 
-@app.post("/ml/generate")
+@app.post("/ml/generate", dependencies=[Depends(require_control_token)])
 def generate_data(req: GenerateDataRequest) -> Dict[str, Any]:
-    """Generate synthetic training data."""
+    from src.ml.data_generator.synthetic_generator import save_synthetic_csv
+
+    output_path = _resolve_data_path(req.output_path, suffix=".csv")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        from src.ml.data_generator.synthetic_generator import save_synthetic_csv
-        
         path = save_synthetic_csv(
-            path=req.output_path,
+            path=str(output_path),
             n_normal=req.n_normal,
             n_attack=req.n_attack,
         )
-        
-        return {
-            "ok": True,
-            "message": f"Generated synthetic data",
-            "path": path,
-            "n_normal": req.n_normal,
-            "n_attack": req.n_attack,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as exc:
+        logger.exception("synthetic data generation failed")
+        raise HTTPException(status_code=500, detail="data generation failed") from exc
+
+    return {
+        "ok": True,
+        "path": _display_path(Path(path).resolve()),
+        "n_normal": req.n_normal,
+        "n_attack": req.n_attack,
+    }
 
 
-@app.post("/ml/retrain")
+@app.post("/ml/retrain", dependencies=[Depends(require_control_token)])
 def retrain(req: RetrainRequest) -> Dict[str, Any]:
-    """
-    Retrain the model.
-    
-    If regenerate=True, will first generate new synthetic data.
-    """
     global predictor
-    
+
+    csv_path = _resolve_data_path(req.csv_path, suffix=".csv")
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
     try:
-        # Optionally regenerate synthetic data
         if req.regenerate:
             from src.ml.data_generator.synthetic_generator import save_synthetic_csv
+
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
             save_synthetic_csv(
-                path=req.csv_path,
+                path=str(csv_path),
                 n_normal=req.n_normal,
                 n_attack=req.n_attack,
             )
-        
-        # Train model
-        artifacts, report = train_from_csv(csv_path=req.csv_path)
-        
-        # Reload predictor with new model
-        predictor = Predictor("data/models/classifier_pipeline.joblib")
-        
-        return {
-            "ok": True,
-            "message": "Model trained successfully",
-            "model_path": artifacts.model_path,
-            "report_path": artifacts.report_path,
-            "metrics": {
-                "accuracy": report["classification_report"]["accuracy"],
-                "f1_macro": report["classification_report"]["macro avg"]["f1-score"],
-                "precision_attack": report["classification_report"].get("1", {}).get("precision", 0),
-                "recall_attack": report["classification_report"].get("1", {}).get("recall", 0),
-            },
-            "cv_f1_mean": report.get("cv_f1_mean", 0),
-            "feature_count": len(artifacts.feature_names),
-        }
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=404, detail=f"Training data not found: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+        artifacts, report = train_from_csv(
+            csv_path=str(csv_path),
+            model_dir=str(MODEL_DIR),
+        )
+        _reload_predictor()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="training data not found") from exc
+    except Exception as exc:
+        logger.exception("model retraining failed")
+        raise HTTPException(status_code=500, detail="model training failed") from exc
+
+    classification = report["classification_report"]
+    return {
+        "ok": True,
+        "model_path": _display_path(Path(artifacts.model_path).resolve()),
+        "report_path": _display_path(Path(artifacts.report_path).resolve()),
+        "metrics": {
+            "accuracy": classification["accuracy"],
+            "f1_macro": classification["macro avg"]["f1-score"],
+            "precision_attack": classification.get("1", {}).get("precision", 0),
+            "recall_attack": classification.get("1", {}).get("recall", 0),
+        },
+        "cv_f1_mean": report.get("cv_f1_mean", 0),
+        "feature_count": len(artifacts.feature_names),
+    }
 
 
 @app.get("/ml/report")
 def get_report() -> Dict[str, Any]:
-    """Get the latest training report."""
-    import json
-    import os
-    
-    report_path = "data/models/train_report.json"
-    
-    if not os.path.exists(report_path):
-        raise HTTPException(status_code=404, detail="No training report found. Train model first.")
-    
-    with open(report_path, "r") as f:
-        report = json.load(f)
-    
+    if not REPORT_PATH.exists():
+        raise HTTPException(status_code=404, detail="no training report found")
+    with REPORT_PATH.open("r", encoding="utf-8") as handle:
+        report = json.load(handle)
     return {"ok": True, "report": report}

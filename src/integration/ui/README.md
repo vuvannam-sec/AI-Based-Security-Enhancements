@@ -1,65 +1,15 @@
-# Streamlit UI
+# Streamlit dashboard
 
-Dashboard và Alerts cho hệ thống AI Security Monitor.
+The dashboard presents service health, recent events, detection history, and local lab controls for the Sensor and Enforcer.
 
-## Chạy
+Run it through the root launcher:
 
-    cd ~/AI-Based-Security-Enhancements
-    source .venv/bin/activate
-    ./scripts/run_ui.sh
+```bash
+./scripts/run_all.sh
+```
 
-Hoặc:
-    streamlit run src/integration/ui/app.py --server.address 0.0.0.0 --server.port 8501
+By default it is available at `http://127.0.0.1:8501`.
 
-Mở trình duyệt: http://localhost:8501
+The UI reads `SENSOR_URL`, `ENFORCER_URL`, `ML_URL`, and `ORCH_API_URL` from the environment. Its API client also reads `AISEC_CONTROL_TOKEN` and attaches it to local control requests, allowing the dashboard to use the same authenticated control plane as the backend services.
 
-## Cấu trúc
-
-    src/integration/ui/
-    ├── app.py              # Main Streamlit app
-    ├── utils.py            # APIClient class
-    ├── app_pages/
-    │   ├── dashboard.py    # Real-time monitoring
-    │   ├── alerts.py       # Enforcement history
-    │   └── settings.py     # Start/stop sensor, config
-    └── components/
-        ├── charts.py       # Plotly charts
-        └── tables.py       # Data tables
-
-## Pages
-
-1. Dashboard:
-   - Service status (Sensor, Enforcer)
-   - Detection metrics (events scanned, threats, blocked)
-   - System metrics gauges (CPU, Memory)
-   - Event stream table
-   - Analytics charts
-
-2. Alerts:
-   - Enforcement history table
-   - Filter by threat type, status, detection method
-   - Manual actions (kill/throttle PID)
-
-3. Settings:
-   - Start/stop Sensor
-   - Toggle Auto-Detect on/off
-   - Configure action (throttle/kill)
-   - Test connections
-
-## Environment variables
-
-    SENSOR_URL=http://localhost:8001
-    ENFORCER_URL=http://localhost:8002
-    ML_URL=http://localhost:8003
-    ORCH_API_URL=http://localhost:8000
-
-## Yêu cầu
-
-Backend services phải chạy trước:
-- Sensor (port 8001)
-- Enforcer (port 8002)
-- ML (port 8003)
-
-## Người phụ trách
-
-Nguyễn Công Sơn
+Do not expose the dashboard as a remote administration interface without adding an appropriate authentication, TLS, and deployment layer. The built-in token is designed for local service-to-service control.

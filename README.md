@@ -1,109 +1,177 @@
-# AI-Based Security Enhancements (OS Project)
+# AI-Based Security Enhancements
 
-Hệ thống phát hiện và ngăn chặn xâm nhập theo thời gian thực trên Linux.
+A Linux host-behavior monitoring prototype that combines `/proc` telemetry, lightweight machine-learning classification, rule-based signals, and cgroup-backed response.
 
-## Tổng quan
+The project is designed for local security research, operating-systems experimentation, and reproducible demonstrations. It is **not** an endpoint-protection product and should not be treated as a production security boundary.
 
-Hệ thống giám sát các tiến trình đang chạy, sử dụng model ML để phát hiện hành vi đáng ngờ, và thực thi phản hồi theo thời gian thực.
+## Architecture
 
-Gồm 5 thành phần chính:
+```text
+                  read-only telemetry
+                       /proc
+                         |
+                         v
+                    +---------+
+                    | Sensor  |
+                    +----+----+
+                         |
+               event     |      prediction
+                         +-----------> +------------+
+                         |             | ML service |
+                         |             +------------+
+                         |
+                         v
+                  +-------------+
+                  | Orchestrator|
+                  +------+------+
+                         |
+                         | authenticated control request
+                         v
+                    +---------+
+                    |Enforcer |
+                    +----+----+
+                         |
+                    cgroup / signal
+                         |
+                         v
+                   Linux processes
 
-- Sensor: Thu thập sự kiện từ tiến trình qua /proc filesystem
-- ML Service: Dự đoán hành vi bình thường hay tấn công (RandomForest)
-- Enforcer: Giới hạn/dừng tiến trình nguy hiểm bằng cgroup v2
-- Orchestrator: API tích hợp pipeline detect-and-respond
-- Streamlit UI: Dashboard và cảnh báo thời gian thực
+              Streamlit UI -> local service APIs
+```
 
-Môi trường: Ubuntu VM (VirtualBox), Python 3.10+
+The Sensor and ML service produce decisions; the Enforcer is the privileged control plane. Mutating endpoints require a shared bearer token, and the bundled launcher binds every service to loopback by default.
 
-## Yêu cầu hệ thống
+A deeper description of the data flow and trust boundaries is in [`docs/architecture.md`](docs/architecture.md).
 
-- Ubuntu 22.04+ (VM hoặc native)
-- Python 3.10+
-- Quyền sudo (cho Enforcer)
+## Current scope
 
-## Cài đặt và huấn luyện (chạy 1 lần)
+Implemented:
 
-cd ~/AI-Based-Security-Enhancements
+- Linux process sampling from `/proc`;
+- normalized event records and CSV export;
+- RandomForest training and inference over generated data;
+- rule-assisted detection for selected host behaviors;
+- CPU and memory throttling through cgroups;
+- explicit process termination through the Enforcer;
+- local dashboard, service status, detection history, and manual controls;
+- authenticated local control operations;
+- automated syntax, lint, and unit/service tests in GitHub Actions.
+
+Not implemented or not production-ready:
+
+- eBPF event collection;
+- production-quality training data or calibrated detection metrics;
+- TLS, user accounts, RBAC, or remote multi-host management;
+- tamper resistance or isolation from a compromised root account;
+- a hardened deployment model for Internet-facing use.
+
+The generated training set is useful for exercising the pipeline, not for making claims about real-world detection accuracy.
+
+## Requirements
+
+- Linux with `/proc` available (Ubuntu 22.04+ is a practical baseline);
+- Python 3.10+;
+- cgroup v2 preferred, with a limited cgroup v1 fallback;
+- `sudo` for the Enforcer service.
+
+## Quick start
+
+```bash
+git clone https://github.com/vuvannam-sec/AI-Based-Security-Enhancements.git
+cd AI-Based-Security-Enhancements
 chmod +x scripts/*.sh
 ./scripts/setup_and_train.sh
-
-Lệnh này sẽ tạo ra:
-
-- data/synthetic/synthetic_events.csv - dữ liệu huấn luyện
-- data/models/classifier_pipeline.joblib - model đã train
-
-## Chạy hệ thống
-
-cd ~/AI-Based-Security-Enhancements
 ./scripts/run_all.sh
+```
 
-Truy cập:
+The launcher generates an ephemeral `AISEC_CONTROL_TOKEN` when one is not already set, exports it to the local services, and does not print it. Services bind to `127.0.0.1` unless explicitly overridden.
 
-- UI Dashboard: http://localhost:8501
-- Sensor API: http://localhost:8001/sensor/status
-- Enforcer API: http://localhost:8002/enforcer/status
-- ML API: http://localhost:8003/ml/status
-- Orchestrator: http://localhost:8000/status
+Local endpoints:
 
-## Demo (giả lập tấn công)
+| Component | Endpoint |
+| --- | --- |
+| Dashboard | `http://127.0.0.1:8501` |
+| Orchestrator | `http://127.0.0.1:8000/status` |
+| Sensor | `http://127.0.0.1:8001/sensor/status` |
+| Enforcer | `http://127.0.0.1:8002/enforcer/status` |
+| ML service | `http://127.0.0.1:8003/ml/status` |
 
-1. Mở UI tại http://localhost:8501
-2. Vào Settings, đảm bảo:
-   - Sensor đang chạy (mode: proc)
-   - Auto-Detect: ON
-   - Action: throttle hoặc kill
+To run services manually, set one shared token first:
 
-3. Chạy test trong terminal khác:
+```bash
+export AISEC_CONTROL_TOKEN="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+```
 
-Test CPU abuse (crypto miner simulation):
-python3 tests/test_scripts/test_attacks.py cpu_abuse 30
+Mutating API calls use:
 
-Test sensitive file access:
-python3 tests/test_scripts/test_attacks.py sensitive_file
+```text
+Authorization: Bearer <AISEC_CONTROL_TOKEN>
+```
 
-Test suspicious execution:
-python3 tests/test_scripts/test_attacks.py suspicious_exec
+The token is a local control-plane guard, not a substitute for TLS or network isolation. Do not bind the privileged Enforcer to an untrusted interface. See [`SECURITY.md`](SECURITY.md).
 
-Test reverse shell:
-python3 tests/test_scripts/test_attacks.py reverse_shell 30
+## Detection pipeline
 
-Chạy tất cả tests:
-python3 tests/test_scripts/test_attacks.py all
+The current pipeline intentionally combines two mechanisms:
 
-4. Quan sát kết quả trên UI Dashboard hoặc:
+1. **ML scoring** — the model classifies normalized process events and returns an attack score and action recommendation.
+2. **Rule fallback** — a small set of explicit behavioral signals catches cases such as sustained high CPU, selected sensitive-file access, suspicious execution paths, and shell/network combinations.
 
-curl -s "http://localhost:8001/sensor/enforcement_history?limit=10" | python3 -m json.tool
+Automatic enforcement is considered only after the Sensor's pre-filter, protected-process checks, cooldown, and final detection decision. The Enforcer independently validates the target PID and resource limits before changing process state.
 
-## Các loại tấn công phát hiện được
+## Demo scenarios
 
-| Loại tấn công | Mô tả | Detection |
-|---------------|-------|-----------|
-| CPU Abuse (Crypto Miner) | CPU > 80% kéo dài | Rule + ML |
-| Sensitive File Access | Đọc /etc/shadow, /etc/passwd... | Rule + ML |
-| Suspicious Exec | Thực thi từ /tmp/, /dev/shm/ | Rule |
-| Reverse Shell | Kết nối đến port nghi ngờ (4444, 5555...) | Rule |
-| Data Exfiltration | Gửi lượng lớn dữ liệu ra ngoài | Future (eBPF) |
+Manual demos live outside the pytest suite so CI never runs stress or process-behavior simulations accidentally.
 
-## Lưu ý kỹ thuật
+```bash
+python3 scripts/demo_scenarios.py cpu --duration 20
+python3 scripts/demo_scenarios.py sensitive-file --duration 10
+python3 scripts/demo_scenarios.py suspicious-exec --duration 10
+python3 scripts/demo_scenarios.py suspicious-network --duration 10
+```
 
-- Enforcer cần sudo vì ghi vào /sys/fs/cgroup/
-- Hệ thống tự động whitelist các service để tránh tự block
-- Mode proc polling mỗi 0.5s, detect trong khoảng 10s
-- Mode eBPF (future): real-time, hỗ trợ data exfiltration detection
+The network demo opens a loopback TCP connection to a flagged port; it does **not** create a shell. Run demos only on systems you own or are authorized to test.
 
-## Phân công công việc
+## Development
 
-| Thành viên | Công việc |
-|------------|-----------|
-| Vũ Văn Nam | Sensor collector (/proc), Schema, CSV exporter |
-| Trần Bình Minh | ML service (train, predict), Feature engineering |
-| Nguyễn Công Sơn | Enforcer (cgroup v2), Scripts, UI, Demo |
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+python -m compileall -q src shared
+ruff check src shared
+pytest -q
+```
+
+Pytest is deliberately scoped to `src/`. Manual workload generators under `scripts/` are not tests.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for project conventions.
+
+## Repository layout
+
+```text
+shared/                  shared contracts and control-auth helpers
+src/sensor/              /proc collection, detection, event export
+src/ml/                  synthetic data, training, inference API
+src/enforcer/            process/cgroup control plane
+src/integration/         orchestration API and Streamlit UI
+scripts/                 setup, launcher, manual demo scenarios
+docs/                    architecture and design notes
+.github/                  CI and dependency-update configuration
+```
+
+Generated datasets, model artifacts, virtual environments, local secrets, private keys, logs, and coverage output are excluded from version control.
+
+## Security and responsible use
+
+The Enforcer can change resource limits and terminate processes. Keep the project on an isolated development machine or lab VM, leave the default loopback bindings in place, and review [`SECURITY.md`](SECURITY.md) before changing the deployment model.
+
+If you find a vulnerability in the project itself, do not publish exploit details in a public issue before the problem can be assessed.
 
 ## References
 
-- Linux /proc filesystem: https://man7.org/linux/man-pages/man5/proc.5.html
-- Cgroup v2: https://docs.kernel.org/admin-guide/cgroup-v2.html
-- scikit-learn RandomForest: https://scikit-learn.org/stable/modules/ensemble.html
-- FastAPI: https://fastapi.tiangolo.com/
-- Streamlit: https://streamlit.io/
+- [Linux `/proc` filesystem](https://man7.org/linux/man-pages/man5/proc.5.html)
+- [Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html)
+- [scikit-learn ensemble methods](https://scikit-learn.org/stable/modules/ensemble.html)
+- [FastAPI](https://fastapi.tiangolo.com/)
+- [Streamlit](https://streamlit.io/)
